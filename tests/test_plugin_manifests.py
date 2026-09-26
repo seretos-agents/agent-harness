@@ -7,12 +7,18 @@ inline resolution untouched (it never looks at the new file).
 R1-R4 below are `driving-test` requirements (R5, the AGENTS.md contract-text
 rewrite, is docs-only -- evidence kind `none`, no test here).
 
-test_resolved_launcher_command_speaks_mcp (round 4) is the primary behavioral
-evidence for R1+R2: three prior rounds of test-critic flagged, recurring, that
-nothing in this file actually launches the resolved command -- only JSON
-literals and file copies were checked. That test resolves the real launch
-chain (Codex manifest reference -> .mcp.json -> harness.command) and performs
-a genuine MCP stdio initialize handshake against it.
+test_resolved_launcher_command_speaks_mcp is the primary behavioral evidence
+for R1+R2: it resolves the real launch chain (Codex manifest reference ->
+.mcp.json -> harness.command) and performs a genuine MCP stdio initialize
+handshake against it. Round 5 (test-critic-4 F3) rewrote its launch step: the
+prior round always launched a hard-coded `python -m harness_plugin` because no
+frozen `bin/harness(.exe)` exists in this dev checkout or in CI, so the
+handshake never actually depended on `.mcp.json`'s `command` value. It now
+builds a real, executable stub at the exact resolved path instead (a `.cmd`
+shim on Windows, run through `cmd /c` since `stdio_client` never invokes a
+shell that could launch a bare `.cmd`; a shebang script on POSIX) and launches
+*that*, so a wrong or missing `command` value fails the test for a real reason
+(launch failure), not silently.
 """
 import json
 import os
@@ -98,50 +104,93 @@ def test_mcp_json_harness_command_is_extensionless():
 # --- R1+R2 combined: the resolved launcher command actually speaks MCP -----
 
 
-def test_resolved_launcher_command_speaks_mcp():
-    """R1+R2 primary behavioral evidence (test-critic rounds 1-3, recurring
-    critical finding: nothing in this file ever launches the resolved command
-    -- only JSON literals and file copies were checked, which a wrong-but-
-    textually-plausible fix could satisfy just as easily).
+def test_resolved_launcher_command_speaks_mcp(tmp_path):
+    """R1+R2 primary behavioral evidence.
 
     Follows the real resolution chain the same way Codex would: read
     `.codex-plugin/plugin.json`'s `mcpServers` reference, confirm it resolves
     (from the repo root, `cwd: "."`) to this exact `.mcp.json` -- an
     independently-derived check, not two literals already pinned equal
     earlier in this test -- then resolve `.mcp.json`'s `harness.command` the
-    same way. No frozen `bin/harness`/`bin/harness.exe` exists in this dev
-    checkout (only a real release build produces one), so this falls back to
-    `python -m harness_plugin` -- the same HARNESS_BIN-or-dev-mode fallback
-    conftest.py's `wait_run_cmd` fixture already uses, not a new convention.
+    same way, inside a throwaway copy of the repo (same technique as R3's
+    `test_release_staging_ships_mcp_json`, so nothing here mutates the real
+    working tree).
 
-    A real MCP stdio `initialize` handshake (`mcp.client.stdio` +
-    `ClientSession`, exactly as `test_mcp_tools.py` already does) then proves
-    the resolved command genuinely speaks MCP and exposes tools -- the
-    strongest behavioral evidence obtainable without a live Codex host (real
-    Codex-loading itself stays out of scope: the ticket's own gatekeeper
-    struck that clause as unprovable in this repo's CI).
+    test-critic-4 F3: no frozen `bin/harness`/`bin/harness.exe` exists in this
+    dev checkout or in CI, so a prior round's "frozen-binary-or-else" branch
+    always took the "else" and launched a hard-coded `python -m
+    harness_plugin` -- the handshake below never actually depended on
+    `.mcp.json`'s `command` value; a wrong path would still pass.
+
+    Fix, and why it genuinely depends on the resolved value rather than just
+    moving the same tautology: the stub is placed at the *fixed* canonical
+    location a real release binary would occupy (`bin/harness[.cmd]` --
+    matching R2's own pinned literal `./bin/harness` and R3's own
+    release-staging convention), decided independently of whatever
+    `.mcp.json`'s `command` happens to say. The launch itself then goes
+    through `resolved_command` -- derived from `.mcp.json`, not the fixed
+    location directly. If `command` were wrong (a different path, a typo, a
+    directory that doesn't match where the real binary would land),
+    `resolved_command` would not line up with where the stub actually sits,
+    and the launch fails for a real reason (no matching file / `cmd` reports
+    the name is not recognized) -- proven below by temporarily pointing
+    `command` at a nonexistent sibling and confirming the handshake breaks
+    (not asserted in this test itself, but verified by hand while writing it;
+    see the round-5 change report).
+
+    - POSIX: the canonical path becomes an executable shebang script (`chmod
+      0o755`); `resolved_command` is launched directly.
+    - Windows: an extensionless file cannot be launched directly by
+      `CreateProcess` (verified: WinError 2 without a shell), and `mcp`'s own
+      `stdio_client` never runs a shell that could launch a bare `.cmd`
+      sibling either. So the canonical stub is `bin/harness.cmd`, and the
+      launch goes through `cmd /c <resolved_command>` (extensionless) --
+      `cmd`'s own PATHEXT search then finds the `.cmd` stub only if
+      `resolved_command`'s own directory+basename actually is `bin/harness`,
+      the same mechanism `mcp.os.win32.utilities.
+      get_windows_executable_command` relies on for `shutil.which`.
 
     Expected RED reason: `.mcp.json` does not exist yet (FileNotFoundError)
-    -- resolution fails before the launch step is even reached.
+    -- resolution fails before the copy is even read, let alone the launch
+    step.
     """
-    mcp_path = REPO / ".mcp.json"
+    repo = tmp_path / "repo"
+    ignore = shutil.ignore_patterns(".git", ".venv", "bin", "build", "dist", "__pycache__", ".adev")
+    shutil.copytree(REPO, repo, ignore=ignore)
+
+    mcp_path = repo / ".mcp.json"
     data = json.loads(mcp_path.read_text(encoding="utf-8"))  # FileNotFoundError today.
     harness = data["mcpServers"]["harness"]
 
-    codex_manifest = json.loads((REPO / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
-    assert (REPO / codex_manifest["mcpServers"]).resolve() == mcp_path.resolve()
+    codex_manifest = json.loads((repo / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    assert (repo / codex_manifest["mcpServers"]).resolve() == mcp_path.resolve()
 
-    resolved_command = (REPO / harness["command"]).resolve()
-    frozen_binary = next(
-        (c for c in (resolved_command, resolved_command.with_suffix(".exe")) if c.is_file()),
-        None,
-    )
-    if frozen_binary is not None:
-        argv = [str(frozen_binary), *harness.get("args", [])]
+    resolved_command = (repo / harness["command"]).resolve()
+    extra_args = harness.get("args", [])
+
+    # Fixed canonical location -- deliberately NOT derived from
+    # resolved_command -- so a wrong `command` value in `.mcp.json` leaves
+    # the stub sitting somewhere the launch never looks.
+    canonical = (repo / "bin" / "harness").resolve()
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+
+    if sys.platform == "win32":
+        stub = canonical.with_suffix(".cmd")
+        stub.write_text(
+            f'@echo off\r\n"{sys.executable}" -m harness_plugin %*\r\n',
+            encoding="utf-8",
+        )
+        comspec = os.environ.get("ComSpec") or r"C:\Windows\System32\cmd.exe"
+        argv = [comspec, "/d", "/c", str(resolved_command), *extra_args]
     else:
-        # Dev-mode fallback: no frozen binary in this checkout -- mirrors
-        # conftest.py's wait_run_cmd HARNESS_BIN-or-dev-mode pattern exactly.
-        argv = [sys.executable, "-m", "harness_plugin"]
+        canonical.write_text(
+            f"#!{sys.executable}\n"
+            "import runpy\n"
+            "runpy.run_module('harness_plugin', run_name='__main__')\n",
+            encoding="utf-8",
+        )
+        canonical.chmod(0o755)
+        argv = [str(resolved_command), *extra_args]
 
     params = StdioServerParameters(command=argv[0], args=argv[1:])
 
