@@ -12,7 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import pytest
 
@@ -29,6 +29,12 @@ def test_codex_manifest_references_mcp_json():
     (Codex resolves the platform binary itself; only the extensionless
     `./bin/harness` form is portable across the two OS-tagged binaries).
 
+    Beyond the JSON-shape check, this chases the reference through: the path
+    Codex would resolve must itself be a file that parses as JSON exposing an
+    `mcpServers.harness.command` key -- not just any file sitting at that
+    path (test-critic-2 F2: a literal-string check on the manifest alone
+    proves nothing about what the reference actually resolves to).
+
     Expected RED reason: `mcpServers` is still an inline dict today.
     """
     raw = (REPO / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
@@ -37,8 +43,13 @@ def test_codex_manifest_references_mcp_json():
     assert manifest["mcpServers"] == "./.mcp.json"
     assert ".exe" not in raw
 
-    # Additional edge-case coverage: the referenced file actually exists.
-    assert (REPO / manifest["mcpServers"]).is_file()
+    # Chase the reference through rather than stopping at is_file(): resolve
+    # it from the repo root and confirm it is itself a valid mcpServers file
+    # with the harness server's command key present.
+    referenced = REPO / manifest["mcpServers"]
+    assert referenced.is_file()
+    referenced_data = json.loads(referenced.read_text(encoding="utf-8"))
+    assert "command" in referenced_data["mcpServers"]["harness"]
 
 
 # --- R2: root .mcp.json declares `harness` extensionless -------------------
@@ -51,6 +62,13 @@ def test_mcp_json_harness_command_is_extensionless():
     `${PLUGIN_ROOT}/bin/harness` or an absolute path (plan-critic note on R2:
     tighten to an exact-literal check).
 
+    Beyond the exact-command check, this pins a real cross-manifest
+    invariant (test-critic-2 F3): the Codex-side `.mcp.json` command and the
+    Claude-side inline `.claude-plugin/plugin.json` command must, once each
+    manifest's own plugin-root placeholder is stripped, resolve to the same
+    `./bin/harness` path -- so a change that moves the binary in one
+    manifest but not the other fails here, not just a standalone literal.
+
     Expected RED reason: `.mcp.json` does not exist yet (FileNotFoundError).
     """
     mcp_path = REPO / ".mcp.json"
@@ -59,12 +77,18 @@ def test_mcp_json_harness_command_is_extensionless():
 
     harness = data["mcpServers"]["harness"]
     assert harness["command"] == "./bin/harness"
-    assert PurePosixPath(harness["command"]).suffix == ""
     assert ".exe" not in raw
 
     # Additional edge-case coverage: args is the empty list, matching the
     # inline Claude/Codex server declarations' shape.
     assert harness["args"] == []
+
+    # Cross-manifest invariant: both manifests' commands ultimately point at
+    # bin/harness under their respective plugin root.
+    claude_manifest = json.loads((REPO / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    claude_cmd = claude_manifest["mcpServers"]["harness"]["command"]
+    assert claude_cmd == "${CLAUDE_PLUGIN_ROOT}/bin/harness"
+    assert claude_cmd.replace("${CLAUDE_PLUGIN_ROOT}", ".") == harness["command"]
 
 
 # --- R3: release staging ships .mcp.json ------------------------------------
@@ -148,9 +172,15 @@ def test_release_staging_ships_mcp_json(tmp_path):
     assert staged_mcp.read_bytes() == (REPO / ".mcp.json").read_bytes()
 
     # Additional edge-case coverage: the staged Codex manifest's mcpServers
-    # path resolves inside the stage dir (not just the repo root).
+    # reference resolves, from inside the stage dir, to this exact staged
+    # .mcp.json -- not merely to some file at that path -- so the staged
+    # bundle is verified as a self-consistent unit (test-critic-2 F1/#3),
+    # not two independently-true facts about the stage dir.
     codex_manifest = json.loads((stage / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
-    assert (stage / codex_manifest["mcpServers"]).is_file()
+    resolved = (stage / codex_manifest["mcpServers"]).resolve()
+    assert resolved == staged_mcp.resolve()
+    resolved_data = json.loads(resolved.read_text(encoding="utf-8"))
+    assert resolved_data["mcpServers"]["harness"]["command"] == "./bin/harness"
 
 
 # --- R4: Claude resolution ignores the new root .mcp.json -------------------
