@@ -65,7 +65,7 @@ def test_codex_manifest_references_mcp_json():
     referenced = REPO / manifest["mcpServers"]
     assert referenced.is_file()
     referenced_data = json.loads(referenced.read_text(encoding="utf-8"))
-    assert "command" in referenced_data["mcpServers"]["harness"]
+    assert referenced_data["mcpServers"]["harness"]["command"] == "./bin/harness"
 
 
 # --- R2: root .mcp.json declares `harness` extensionless -------------------
