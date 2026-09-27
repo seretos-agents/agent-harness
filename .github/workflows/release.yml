@@ -277,6 +277,15 @@ jobs:
           echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
           echo "asset=$ZIP"   >> "$GITHUB_OUTPUT"
 
+          # Capture the description now, while stamped/ still exists — the next
+          # step (orphan branch checkout) runs `git clean -fdx`, which deletes
+          # this untracked download-artifact tree before the dispatch steps run.
+          {
+            echo "description<<DESC_EOF"
+            jq -r '.description' stamped/.claude-plugin/plugin.json
+            echo "DESC_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Push orphan release branch and capture commit
         id: rel
         shell: bash
@@ -356,8 +365,8 @@ jobs:
           VERSION: ${{ inputs.version }}
           NAME:    ${{ needs.stamp.outputs.plugin_name }}
           TAG:     ${{ needs.stamp.outputs.tag }}
+          DESC:    ${{ steps.stage.outputs.description }}
         run: |
-          DESC=$(jq -r '.description' stamped/.claude-plugin/plugin.json)
           curl -fsSL -X POST \
             -H "Authorization: Bearer $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
@@ -385,8 +394,8 @@ jobs:
           VERSION: ${{ inputs.version }}
           NAME:    ${{ needs.stamp.outputs.plugin_name }}
           TAG:     ${{ needs.stamp.outputs.tag }}
+          DESC:    ${{ steps.stage.outputs.description }}
         run: |
-          DESC=$(jq -r '.description' stamped/.claude-plugin/plugin.json)
           curl -fsSL -X POST \
             -H "Authorization: Bearer $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
