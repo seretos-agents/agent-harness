@@ -88,6 +88,10 @@ None of the three pins a `model:` or `effort:`; a run inherits them from the par
 
 Colon-qualified plugin-agent dispatch is covered by a fake-CLI test in CI plus an opt-in live test (`tests/test_live_claude.py::test_live_start_plugin_agent_colon_qualified`), deselected by default. To run it, provision a real `CLAUDE_CONFIG_DIR` holding a `harness-live-fixture@<any>` plugin install with `agents/echo.md` (`model: haiku`, `tools: Read`), `settings.json` enabling that plugin, and real credentials; point `HARNESS_LIVE_PLUGIN_CONFIG_DIR` at it and run `python -m pytest -m live tests/test_live_claude.py`.
 
+## Native subagent dispatch is disabled
+
+A `PreToolUse` hook denies Claude Code's built-in subagent tool (`Agent`, and its legacy alias `Task`) unconditionally, in every session the plugin is installed in — no opt-in flag. The denial names `harness_start_agent` and `harness_start_prompt` as the replacement: use one of those instead of the native tool. This applies inside a `harness_start_agent`-launched child too, since it loads the plugin (and this same hook) just like the parent session — a harness-launched agent cannot escape the restriction by spawning a native subagent of its own.
+
 ## MCP servers
 
 A `harness_start_agent` run inherits the *parent* Claude Code session's own MCP-server set — project (`.mcp.json`, approved), user/local (`~/.claude.json`), and every enabled plugin's own manifest — rebuilt explicitly from those files and passed to the child's launch, rather than left for the child to discover (and possibly still be waiting to connect to at its first turn) on its own. A plugin's servers are keyed `plugin_<plugin>_<server>` (e.g. `plugin_agent-serena-wrapper_serena`) to avoid name collisions across plugins and to keep the native `mcp__plugin_<plugin>_<server>__*` tool names, with one exception: the `agent-harness` plugin's own `harness` server keeps the literal bare key `harness`, since that is the name a run's own tool calls use (`mcp__harness__*`) and the name `.seretos/harness.yml`'s `canSpawn` grants.
