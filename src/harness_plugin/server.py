@@ -399,11 +399,9 @@ def harness_inspect_run(run_id: str) -> dict[str, Any]:
     alongside. `requested.{mcp_servers,tools,skills,agents,disallowed_tools}` are the same
     categories the harness itself put into this run, read back from its own recorded argv --
     populated even when the init event announced nothing, since it comes from a
-    different artifact. `disallowed_tools` is the one exception to "argv": it is read from
-    the `--agents` JSON payload's per-agent `disallowedTools` key (there is no top-level
-    `--disallowedTools` flag on this dispatch path), so it is `[]` both when no denylist was
-    set and when the run used the materialized-agent-file carrier instead of the `--agents`
-    payload -- the two are indistinguishable at this carrier. `system_prompt` carries the
+    different artifact. `disallowed_tools` is plain argv like the rest: it is read
+    from the top-level `--disallowedTools` CSV flag, populated the same way for both
+    the `--agents` payload and materialized-agent-file carriers. `system_prompt` carries the
     exact text sent, with `source`
     naming which carrier supplied it (--system-prompt, --agents, or the materialized
     agent file), `chars`, `sha256`, and `recorded_sha256` (the run's own recorded

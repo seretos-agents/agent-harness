@@ -154,15 +154,13 @@ def _dedup(items: list[str]) -> list[str]:
 def _requested_names(argv: list[str]) -> dict[str, list[str]]:
     """What the harness itself asked for, read back from this run's own recorded argv
     -- independent of what the init event announced (see module docstring / plan): the
-    `--agents` JSON's keys and each entry's own `skills` and `disallowedTools`, the
-    `--agent` value, the `--mcp-config` JSON's `mcpServers` keys, and the `--tools` CSV.
-    `disallowed_tools` mirrors `skills`: read only from the `--agents` payload's
-    per-agent `disallowedTools` key, so a run dispatched via the materialized `.md`
-    file carrier (no `--agents` payload) reports `[]`, same as a run with no denylist
-    at all -- the two are indistinguishable at this carrier (see plan, #56)."""
+    `--agents` JSON's keys and each entry's own `skills`, the `--agent` value, the
+    `--mcp-config` JSON's `mcpServers` keys, and the `--tools` and `--disallowedTools`
+    CSVs. `disallowed_tools` mirrors `tools`: read from the top-level `--disallowedTools`
+    CSV flag, which lib-python-harness v0.0.9 emits independently of the payload vs.
+    materialized-file carrier split, so it is populated on both."""
     agents: list[str] = []
     skills: list[str] = []
-    disallowed: list[str] = []
     agents_json = _flag(argv, "--agents")
     if agents_json:
         try:
@@ -173,7 +171,6 @@ def _requested_names(argv: list[str]) -> dict[str, list[str]]:
             agents.append(name)
             if isinstance(fields, dict):
                 skills.extend(fields.get("skills") or [])
-                disallowed.extend(fields.get("disallowedTools") or [])
     agent_flag = _flag(argv, "--agent")
     if agent_flag:
         agents.append(agent_flag)
@@ -192,10 +189,15 @@ def _requested_names(argv: list[str]) -> dict[str, list[str]]:
     if tools_flag is not None:
         tools = [t for t in tools_flag.split(",") if t]
 
+    disallowed_tools: list[str] = []
+    disallowed_flag = _flag(argv, "--disallowedTools")
+    if disallowed_flag is not None:
+        disallowed_tools = [t for t in disallowed_flag.split(",") if t]
+
     return {
         "agents": _dedup(agents),
         "skills": _dedup(skills),
-        "disallowed_tools": _dedup(disallowed),
+        "disallowed_tools": disallowed_tools,
         "mcp_servers": mcp_servers,
         "tools": tools,
     }
