@@ -105,7 +105,7 @@ def test_failed_run_exits_one(server_params, wait_run_env, wait_run_cmd):
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason=(
-        "lib-python-harness v0.0.8 (re-verified, still failing 5/5 on Windows): Harness.stop() "
+        "lib-python-harness v0.0.9 (re-verified, still failing 5/5 on Windows): Harness.stop() "
         "inside the stdio MCP server does not win the race on Windows, so wait_for "
         "finalises the run FAILED before CANCELLED is written; exit 3 is covered on Linux"
     ),
