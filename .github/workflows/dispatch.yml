@@ -55,7 +55,7 @@ jobs:
 
       - name: Dispatch to modular-software-factory (curated, PR review)
         env:
-          GH_PAT:  ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
+          GH_PAT:  ${{ secrets.ECOSYSTEM_TOKEN }}
           NAME:    ${{ steps.meta.outputs.name }}
           DESC:    ${{ steps.meta.outputs.description }}
           VERSION: ${{ steps.tag.outputs.version }}
@@ -84,7 +84,7 @@ jobs:
 
       - name: Dispatch to modular-software-factory-staging (direct)
         env:
-          GH_PAT:  ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
+          GH_PAT:  ${{ secrets.ECOSYSTEM_TOKEN }}
           NAME:    ${{ steps.meta.outputs.name }}
           DESC:    ${{ steps.meta.outputs.description }}
           VERSION: ${{ steps.tag.outputs.version }}
