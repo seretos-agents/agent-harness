@@ -104,6 +104,17 @@ def probe_warning(env: Mapping[str, str] | None = None) -> str | None:
     )
 
 
+def artifacts_root() -> Path:
+    """Where run records/artifacts live (`<root>/<run_id>/record.json`, etc).
+    Moved here (#62) from `runs.py` -- verbatim, `runs.py` re-imports it --
+    so the per-tool-call `hook` subcommand can read a run's `state` off disk
+    without importing `lib_python_harness` at module level."""
+    override = os.environ.get("HARNESS_ARTIFACTS_DIR")
+    root = Path(override) if override else Path.home() / ".agent-harness" / "runs"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def _config_root() -> Path:
     base = os.environ.get("CLAUDE_CONFIG_DIR")
     return Path(base) if base else Path.home() / ".claude"

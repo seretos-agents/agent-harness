@@ -72,6 +72,21 @@ It prints one `harness_poll_run`-shaped JSON object plus `waited_s` on stdout an
 | 3 | run CANCELLED |
 | 4 | error: unknown run id, unreadable artifacts dir, or invalid arguments |
 
+## A session cannot end while it started a run that is still going
+
+A `PostToolUse` hook tracks every run a session starts with `harness_start_agent`, `harness_start_prompt` or `harness_send_message` (the `run_id` each returns). At `Stop`, unconditionally and with no opt-out, the hook blocks turn-end (exit 2) unless every run tracked for that session has reached a terminal state (COMPLETED, FAILED or CANCELLED) — the stderr message names the pending `run_id`(s). This closes the failure mode where an agent starts an async run and then ends its own turn without ever waiting on or stopping it, orphaning the run: nobody polls or stops it, and its result is never collected.
+
+There are exactly two ways out of the block:
+
+- Keep calling `harness_wait_run` / `harness_poll_run` on the pending run(s) until they report a terminal state, or
+- Call `harness_stop_run` to cancel a run you no longer need — this reaches CANCELLED even for a run started before the current MCP server process, as long as the run's pid identity can still be resolved (see `harness.py`'s `stop()`/`_pid_status`); if the server has restarted and pid identity can no longer be decided, `harness_stop_run` may not be able to bring that one run to CANCELLED, and a session that only has that run pending could stay blocked. This is a known, documented limitation, not a bug — no change to `lib_python_harness` is in scope here.
+
+The guard also covers `harness_cleanup_run`: a `PreToolUse` hook denies it for any run tracked in this session whose record is still non-terminal, so cleanup cannot be used as an escape hatch from the block (`harness_cleanup_run` itself has no state check of its own).
+
+This applies inside a `harness_start_agent`-launched child too — it loads the same hooks.json, so a child that starts its own runs is held to the same rule; there is no flag to disable it.
+
+**Shared artifacts root.** The hook process and the MCP server must agree on where run records live: both fall back to `~/.agent-harness/runs` unless `HARNESS_ARTIFACTS_DIR` is set, in which case it must be set the same way for both. If only one side sees the override, the hook reads no record for a run the server tracks elsewhere, which fails open (Stop does not block) — silently, since there is no way for the hook to tell "no such run" apart from "record lives somewhere else."
+
 ## Plugin agents
 
 A plugin's own `agents/*.md` definitions are discovered alongside project (`.claude/agents/`) and user-scope agents. A plugin-sourced agent is listed by `harness_list_agents` and started via `harness_start_agent` under a qualified name, `<plugin>:<name>` (e.g. `agent-harness:general-purpose`) — not the bare `<name>` that project- and user-scope agents use. Its `tools:` frontmatter field binds to the run's `--tools` allowlist, the same as any other agent definition: a `tools:` line is the complete list of tools the run gets, and a definition without one gets every tool. Its `disallowedTools:` frontmatter field is a denylist on top of that: a tool named in both `tools:` and `disallowedTools:` is denied, and with no `tools:` line at all the run gets every tool except the ones `disallowedTools:` names. Claude itself enforces the denylist (a call to a denied tool fails as unavailable). `harness_inspect_run` reads it back as `requested.disallowed_tools` from the run's top-level `--disallowedTools` flag, for both the `--agents` payload and materialized-file carriers.
