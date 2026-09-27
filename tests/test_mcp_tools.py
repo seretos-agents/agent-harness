@@ -1280,16 +1280,6 @@ def test_plugin_agent_lists_and_starts_colon_qualified_with_tools(
     assert _agents_payload(record)["agent-harness:probe"]["tools"] == ["Read", "Glob"]
 
 
-# lib-python-harness v0.0.9 emits a new top-level --disallowedTools flag on this
-# dispatch path in addition to the --agents JSON payload's per-agent key that this
-# test's assertions below assume is the only carrier. #56 migrates runs.py and this
-# assertion to account for the new flag and removes this xfail marker.
-_V0_0_9_DISALLOWED_TOOLS_XFAIL_REASON = (
-    "lib-python-harness v0.0.9 emits a new top-level --disallowedTools flag; "
-    "#56 migrates runs.py and this assertion and removes this marker"
-)
-
-
 @pytest.mark.parametrize(
     "frontmatter,expect_tools",
     [
@@ -1297,26 +1287,26 @@ _V0_0_9_DISALLOWED_TOOLS_XFAIL_REASON = (
             "disallowedTools: Edit, Write",
             None,
             id="deny-only",
-            marks=pytest.mark.xfail(strict=True, reason=_V0_0_9_DISALLOWED_TOOLS_XFAIL_REASON),
         ),
         pytest.param(
             "disallowedTools: Edit, Write\ntools: Read, Edit",
             ["Read", "Edit"],
             id="combined",
-            marks=pytest.mark.xfail(strict=True, reason=_V0_0_9_DISALLOWED_TOOLS_XFAIL_REASON),
         ),
     ],
 )
 def test_plugin_agent_binds_disallowed_tools_and_inspect_reads_it_back(
     server_params, plugin_agent_install, project_dir, argv_log, frontmatter, expect_tools
 ):
-    """#50: a plugin agent's `disallowedTools:` frontmatter reaches the launched
-    child via the `--agents` JSON payload's per-agent `disallowedTools` key -- there
-    is no top-level `--disallowedTools` flag on this dispatch path (settled, human
-    decision; see plan) -- and `harness_inspect_run` reads it back as
-    `requested.disallowed_tools`. The `combined` case additionally proves the
-    allowlist (`tools:`) and the denylist (`disallowedTools:`) stay two distinct
-    payload keys, unmerged, and land as two distinct `requested` lists."""
+    """#50/#56: a plugin agent's `disallowedTools:` frontmatter reaches the launched
+    child via lib-python-harness v0.0.9's top-level `--disallowedTools` CSV flag
+    (emitted before and independently of the payload/materialized carrier split) --
+    the `--agents` JSON payload's per-agent `disallowedTools` key still carries it
+    too, since the library sends it there as well -- and `harness_inspect_run` reads
+    `requested.disallowed_tools` back from the flag, mirroring `tools`. The
+    `combined` case additionally proves the allowlist (`tools:`) and the denylist
+    (`disallowedTools:`) stay two distinct flags/payload keys, unmerged, and land as
+    two distinct `requested` lists."""
     (plugin_agent_install / "agents" / "guarded.md").write_text(
         f"---\nname: guarded\ndescription: Guarded agent for disallowedTools tests\n"
         f"{frontmatter}\n---\nSay OK.\n",
@@ -1342,10 +1332,7 @@ def test_plugin_agent_binds_disallowed_tools_and_inspect_reads_it_back(
 
     (record,) = _argv_records(argv_log)
     assert _flag(record["argv"], "--agent") == "agent-harness:guarded"
-    assert "--disallowedTools" not in record["argv"], (
-        "there is no top-level --disallowedTools flag on this dispatch path -- the "
-        "denylist travels only inside the --agents JSON payload"
-    )
+    assert _flag(record["argv"], "--disallowedTools") == "Edit,Write"
     payload_entry = _agents_payload(record)["agent-harness:guarded"]
     assert payload_entry["disallowedTools"] == ["Edit", "Write"]
     requested = inspected["requested"]
@@ -1361,6 +1348,58 @@ def test_plugin_agent_binds_disallowed_tools_and_inspect_reads_it_back(
         assert _flag(record["argv"], "--tools") == ",".join(expect_tools)
         assert payload_entry["tools"] == expect_tools
         assert requested["tools"] == expect_tools
+
+
+def test_materialized_agent_disallowed_tools_read_back_from_flag(
+    server_params, mcp_agent_project, argv_log
+):
+    """#56: an agent dispatched via the materialized `.claude/agents/<stem>.md`
+    carrier (its `mcpServers:` frontmatter forces that carrier -- see
+    `mcp_agent_project`, no `--agents` JSON payload is ever emitted for it) still
+    carries a `disallowedTools:` denylist through lib-python-harness v0.0.9's
+    top-level `--disallowedTools` CSV flag, which the library emits before and
+    independently of the payload/materialized carrier split. `harness_inspect_run`
+    must read `requested.disallowed_tools` back from that flag -- the only carrier
+    available here, since this dispatch never sends an `--agents` payload."""
+    agents_dir = mcp_agent_project / ".claude" / "agents"
+    (agents_dir / "guarded-mcp.md").write_text(
+        "---\n"
+        "name: guarded-mcp\n"
+        "description: Materialized-carrier agent with a denylist\n"
+        "mcpServers:\n"
+        "  demo-server:\n"
+        "    command: demo\n"
+        "disallowedTools: Edit, Write\n"
+        "---\n"
+        "Say OK.\n",
+        encoding="utf-8",
+    )
+
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session,
+            "harness_start_agent",
+            agent="guarded-mcp",
+            cwd=str(mcp_agent_project),
+            model="sonnet",
+        )
+        assert not is_error, text
+        final = await _poll_until_terminal(session, started["run_id"])
+        inspected = await _call(session, "harness_inspect_run", run_id=started["run_id"])
+        return final, inspected
+
+    final, (is_error, text, inspected) = _run(scenario, server_params)
+    assert not is_error, text
+    assert final["state"] == "COMPLETED"
+
+    (record,) = _argv_records(argv_log)
+    assert "--agents" not in record["argv"], (
+        "this carrier must never emit --agents -- otherwise this test would not "
+        "exercise the materialized-carrier path #56 is about"
+    )
+    assert _flag(record["argv"], "--disallowedTools") == "Edit,Write"
+    requested = inspected["requested"]
+    assert requested["disallowed_tools"] == ["Edit", "Write"]
 
 
 def test_project_agent_overrides_plugin_agent_by_qualified_name(
