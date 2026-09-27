@@ -1280,6 +1280,71 @@ def test_plugin_agent_lists_and_starts_colon_qualified_with_tools(
     assert _agents_payload(record)["agent-harness:probe"]["tools"] == ["Read", "Glob"]
 
 
+@pytest.mark.parametrize(
+    "frontmatter,expect_tools",
+    [
+        pytest.param("disallowedTools: Edit, Write", None, id="deny-only"),
+        pytest.param(
+            "disallowedTools: Edit, Write\ntools: Read, Edit", ["Read", "Edit"], id="combined"
+        ),
+    ],
+)
+def test_plugin_agent_binds_disallowed_tools_and_inspect_reads_it_back(
+    server_params, plugin_agent_install, project_dir, argv_log, frontmatter, expect_tools
+):
+    """#50: a plugin agent's `disallowedTools:` frontmatter reaches the launched
+    child via the `--agents` JSON payload's per-agent `disallowedTools` key -- there
+    is no top-level `--disallowedTools` flag on this dispatch path (settled, human
+    decision; see plan) -- and `harness_inspect_run` reads it back as
+    `requested.disallowed_tools`. The `combined` case additionally proves the
+    allowlist (`tools:`) and the denylist (`disallowedTools:`) stay two distinct
+    payload keys, unmerged, and land as two distinct `requested` lists."""
+    (plugin_agent_install / "agents" / "guarded.md").write_text(
+        f"---\nname: guarded\ndescription: Guarded agent for disallowedTools tests\n"
+        f"{frontmatter}\n---\nSay OK.\n",
+        encoding="utf-8",
+    )
+
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session,
+            "harness_start_agent",
+            agent="agent-harness:guarded",
+            cwd=str(project_dir),
+            model="sonnet",
+        )
+        assert not is_error, text
+        final = await _poll_until_terminal(session, started["run_id"])
+        inspected = await _call(session, "harness_inspect_run", run_id=started["run_id"])
+        return final, inspected
+
+    final, (is_error, text, inspected) = _run(scenario, server_params)
+    assert not is_error, text
+    assert final["state"] == "COMPLETED"
+
+    (record,) = _argv_records(argv_log)
+    assert _flag(record["argv"], "--agent") == "agent-harness:guarded"
+    assert "--disallowedTools" not in record["argv"], (
+        "there is no top-level --disallowedTools flag on this dispatch path -- the "
+        "denylist travels only inside the --agents JSON payload"
+    )
+    payload_entry = _agents_payload(record)["agent-harness:guarded"]
+    assert payload_entry["disallowedTools"] == ["Edit", "Write"]
+    requested = inspected["requested"]
+    assert requested["disallowed_tools"] == ["Edit", "Write"]
+
+    if expect_tools is None:
+        assert "--tools" not in record["argv"]
+        assert "tools" not in payload_entry, (
+            "deny-only frontmatter sets no tools: -- the payload must not synthesize "
+            "an allowlist key that was never declared"
+        )
+    else:
+        assert _flag(record["argv"], "--tools") == ",".join(expect_tools)
+        assert payload_entry["tools"] == expect_tools
+        assert requested["tools"] == expect_tools
+
+
 def test_project_agent_overrides_plugin_agent_by_qualified_name(
     server_params, plugin_agent_install, project_dir
 ):
@@ -1545,6 +1610,11 @@ def test_inspect_run_reports_requested_names_from_argv(
         "--tools-present branch needs its own coverage"
     )
     assert requested["tools"] == []
+    assert "--disallowedTools" not in record["argv"], (
+        "this fixture's dispatch does not set a denylist; if that changes, the "
+        "--disallowedTools-present branch needs its own coverage"
+    )
+    assert requested["disallowed_tools"] == []
 
     # Second case: init event announced nothing, but the argv-derived fallback still is.
     assert payload2["announced"]["skills"] == []
@@ -1577,6 +1647,7 @@ def test_inspect_run_requested_defaults_to_empty_lists_for_clean_run(server_para
     requested = payload["requested"]
     assert requested["agents"] == [], "absence must be a list, never null"
     assert requested["mcp_servers"] == [], "absence must be a list, never null"
+    assert requested["disallowed_tools"] == [], "absence must be a list, never null"
 
 
 def test_inspect_run_returns_system_prompt_text_per_carrier(
