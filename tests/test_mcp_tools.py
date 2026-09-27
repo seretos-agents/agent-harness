@@ -1293,10 +1293,12 @@ def test_plugin_agent_binds_disallowed_tools_and_inspect_reads_it_back(
     server_params, plugin_agent_install, project_dir, argv_log, frontmatter, expect_tools
 ):
     """#50: a plugin agent's `disallowedTools:` frontmatter reaches the launched
-    child's argv as a top-level `--disallowedTools` CSV -- the migration path for a
-    safety-restricted subagent -- and `harness_inspect_run` reads it back as
+    child via the `--agents` JSON payload's per-agent `disallowedTools` key -- there
+    is no top-level `--disallowedTools` flag on this dispatch path (settled, human
+    decision; see plan) -- and `harness_inspect_run` reads it back as
     `requested.disallowed_tools`. The `combined` case additionally proves the
-    allowlist (`tools:`) and the denylist (`disallowedTools:`) reach argv unmerged."""
+    allowlist (`tools:`) and the denylist (`disallowedTools:`) stay two distinct
+    payload keys, unmerged, and land as two distinct `requested` lists."""
     (plugin_agent_install / "agents" / "guarded.md").write_text(
         f"---\nname: guarded\ndescription: Guarded agent for disallowedTools tests\n"
         f"{frontmatter}\n---\nSay OK.\n",
@@ -1322,14 +1324,24 @@ def test_plugin_agent_binds_disallowed_tools_and_inspect_reads_it_back(
 
     (record,) = _argv_records(argv_log)
     assert _flag(record["argv"], "--agent") == "agent-harness:guarded"
-    assert _flag(record["argv"], "--disallowedTools") == "Edit,Write"
+    assert "--disallowedTools" not in record["argv"], (
+        "there is no top-level --disallowedTools flag on this dispatch path -- the "
+        "denylist travels only inside the --agents JSON payload"
+    )
+    payload_entry = _agents_payload(record)["agent-harness:guarded"]
+    assert payload_entry["disallowedTools"] == ["Edit", "Write"]
     requested = inspected["requested"]
     assert requested["disallowed_tools"] == ["Edit", "Write"]
 
     if expect_tools is None:
         assert "--tools" not in record["argv"]
+        assert "tools" not in payload_entry, (
+            "deny-only frontmatter sets no tools: -- the payload must not synthesize "
+            "an allowlist key that was never declared"
+        )
     else:
         assert _flag(record["argv"], "--tools") == ",".join(expect_tools)
+        assert payload_entry["tools"] == expect_tools
         assert requested["tools"] == expect_tools
 
 
