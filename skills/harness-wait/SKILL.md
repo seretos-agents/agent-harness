@@ -13,6 +13,13 @@ So when a wait limit elapses on an unfinished run: keep waiting. Do not restart 
 do not start a replacement, and do not report the run as cancelled, failed or dead - the
 work it has already done is still running and still paid for.
 
+There is also no ending your own turn on it. If you started this run (`harness_start_agent`,
+`harness_start_prompt` or `harness_send_message`) in the current session, a `Stop` hook
+blocks turn-end until it reaches a terminal state - you cannot fall back on hoping to be
+"woken up" later to collect the result. Keep waiting (path A or B below) or call
+`harness_stop_run` on it; `harness_cleanup_run` is denied while it is still non-terminal, so
+it is not a way around the block either.
+
 An elapsed limit is not news about the run. It tells you only that the run needed longer
 than you allowed it this time; it says nothing about whether the run is healthy. What the
 run is actually doing is in its `state` and its liveness fields, and you can read those at

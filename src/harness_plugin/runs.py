@@ -13,6 +13,8 @@ from typing import Any
 
 from lib_python_harness import ClaudeCliProvider, FileRunStore, Harness, HarnessError
 
+from harness_plugin.host_context import artifacts_root  # noqa: F401 -- re-exported (#62): server.py/wait_run.py import it from here
+
 _HARNESS: Harness | None = None
 
 # Public contract name (#51): the env var a `harness_start_agent` child (and any
@@ -310,13 +312,6 @@ def remember_effort_source(run_id: str, source: str) -> None:
         return
     record["effort_source"] = source
     h.store.put(run_id, record)
-
-
-def artifacts_root() -> Path:
-    override = os.environ.get("HARNESS_ARTIFACTS_DIR")
-    root = Path(override) if override else Path.home() / ".agent-harness" / "runs"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
 
 
 def claude_argv() -> list[str]:
