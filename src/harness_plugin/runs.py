@@ -10,9 +10,24 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from lib_python_harness import FileRunStore, Harness, HarnessError
+from lib_python_harness import ClaudeCliProvider, FileRunStore, Harness, HarnessError
 
 _HARNESS: Harness | None = None
+
+# Public contract name (#51): the env var a `harness_start_agent` child (and any
+# `harness_send_message` follow-up on it) finds its own qualified agent name under,
+# so a hook running inside that child -- e.g. its own `Stop` hook -- can tell which
+# agent it is running as. See README.md's "Agent identity inside a run" section.
+LAUNCHED_AGENT_ENV = "HARNESS_LAUNCHED_AGENT"
+
+
+class _AgentIdentityProvider(ClaudeCliProvider):
+    """Wraps `ClaudeCliProvider` to inject `LAUNCHED_AGENT_ENV` into a launched
+    child's (and its resumed follow-ups') environment. Skeleton only -- the real
+    `build_launch_plan`/`build_resume_plan` overrides that actually set/pop the
+    var land in the implement phase; this stub exists so tests exercising it
+    fail for the missing behaviour, not an ImportError."""
+
 
 # Init-event key(s) each announced category may be spelled under, primary spelling
 # first. NOTE: only `mcp_servers` carries a known alternate spelling (`mcpServers`) --

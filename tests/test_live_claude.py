@@ -790,6 +790,160 @@ def test_live_mcp_announcement_stable_across_runs(live_server_params, tmp_path):
         pytest.skip(f"held vacuously: no MCP server was announced in any run:\n{report}")
 
 
+# --- launched-agent identity visible to a real plugin Stop hook, live (#51 R4) -----
+
+
+@pytest.mark.timeout(300)
+def test_live_launched_agent_visible_to_plugin_stop_hook():
+    """R4: in a real run of a plugin agent, the plugin's own Stop hook -- running
+    inside that same child `claude` process -- reads HARNESS_LAUNCHED_AGENT and
+    sees the qualified name, colon included. This is the ticket's actual consumer:
+    a hook script (not this test harness) telling which agent its own process is
+    running as. Self-provisions like test_live_parent_mcp_servers_at_first_turn: a
+    short tempfile.mkdtemp root, a copied .credentials.json (skipped if absent or
+    `claude` is not on PATH), and a real `claude plugin marketplace add` / `install
+    harness-id-fixture@lt -y` under an isolated CLAUDE_CONFIG_DIR.
+
+    There is deliberately no SessionStart fallback here: the ticket's consumer is a
+    Stop-event guard, so if Stop does not fire in `-p` mode this test fails outright
+    rather than silently swapping to a different event.
+
+    Expected RED reason: seen.json's "agent" field is None (nothing sets
+    HARNESS_LAUNCHED_AGENT in a real child's environment today)."""
+    if shutil.which("claude") is None:
+        pytest.skip("the real `claude` CLI is not on PATH")
+    real_credentials = _real_credentials_path()
+    if not real_credentials.is_file():
+        pytest.skip(f"no real credentials at {real_credentials}; cannot run a live child")
+
+    tmp_path = Path(tempfile.mkdtemp(prefix="ah51-"))
+    config_dir = tmp_path / "claude-config"
+    project_dir = tmp_path / "live-project"
+    project_dir.mkdir(parents=True)
+    config_dir.mkdir(parents=True)
+    shutil.copy(real_credentials, config_dir / ".credentials.json")
+
+    marketplace_dir = tmp_path / "marketplace"
+    fixture_dir = marketplace_dir / "harness-id-fixture"
+    (fixture_dir / "agents").mkdir(parents=True)
+    (fixture_dir / "agents" / "idcheck.md").write_text(
+        "---\n"
+        "name: idcheck\n"
+        "description: R4 live fixture agent -- always replies OK\n"
+        "model: haiku\n"
+        "---\n"
+        "Reply OK.\n",
+        encoding="utf-8",
+    )
+
+    seen_path = tmp_path / "seen.json"
+    hook_path = fixture_dir / "hook.py"
+    hook_path.write_text(
+        "import json, os, sys\n"
+        "payload = json.loads(sys.stdin.read())\n"
+        "out = {'event': payload.get('hook_event_name'), "
+        "'agent': os.environ.get('HARNESS_LAUNCHED_AGENT')}\n"
+        "with open(sys.argv[1], 'w', encoding='utf-8') as fh:\n"
+        "    json.dump(out, fh)\n",
+        encoding="utf-8",
+    )
+    _write_json(
+        fixture_dir / "hooks" / "hooks.json",
+        {
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": (
+                                    f'"{sys.executable}" "{hook_path}" "{seen_path}"'
+                                ),
+                                "timeout": 10,
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+    )
+    _write_json(
+        fixture_dir / ".claude-plugin" / "plugin.json",
+        {"name": "harness-id-fixture", "hooks": "./hooks/hooks.json"},
+    )
+    _write_json(
+        marketplace_dir / ".claude-plugin" / "marketplace.json",
+        {
+            "name": "lt",
+            "owner": {"name": "R4 live fixture"},
+            "metadata": {"version": "0.0.0", "description": "R4 live fixture marketplace"},
+            "plugins": [
+                {
+                    "name": "harness-id-fixture",
+                    "description": "R4 live fixture: Stop hook reads HARNESS_LAUNCHED_AGENT",
+                    "source": "./harness-id-fixture",
+                    "category": "other",
+                    "version": "0.0.0",
+                },
+            ],
+        },
+    )
+
+    setup_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_dir)}
+    added = subprocess.run(
+        ["claude", "plugin", "marketplace", "add", str(marketplace_dir)],
+        capture_output=True, text=True, timeout=60, env=setup_env,
+    )
+    assert added.returncode == 0, f"marketplace add failed: {added.stdout} {added.stderr}"
+    installed = subprocess.run(
+        ["claude", "plugin", "install", "harness-id-fixture@lt", "-y"],
+        capture_output=True, text=True, timeout=60, env=setup_env,
+    )
+    assert installed.returncode == 0, f"install failed: {installed.stdout} {installed.stderr}"
+
+    env = {**os.environ}
+    env.pop("HARNESS_CLAUDE_ARGV", None)
+    env["HARNESS_ARTIFACTS_DIR"] = str(tmp_path / "artifacts")
+    env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    env["CLAUDE_PLUGIN_DATA"] = str(tmp_path / "plugin-data")
+    env["CLAUDE_CODE_SESSION_ID"] = SESSION_ID
+    from conftest import plant_session_file
+
+    plant_session_file(
+        tmp_path / "plugin-data",
+        SESSION_ID,
+        cwd=str(project_dir),
+        project_dir=str(project_dir),
+        permission_mode="bypassPermissions",
+        model="haiku",
+    )
+    from mcp import StdioServerParameters
+
+    params = StdioServerParameters(command=sys.executable, args=["-m", "harness_plugin"], env=env)
+
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session,
+            "harness_start_agent",
+            agent="harness-id-fixture:idcheck",
+            cwd=str(project_dir),
+        )
+        assert not is_error, text
+        return await _poll_until_terminal(session, started["run_id"], budget=240.0)
+
+    final = _run_live(scenario, params, timeout_s=280.0)
+    assert final["state"] == "COMPLETED", final
+    assert seen_path.exists(), (
+        "the fixture plugin's own Stop hook (hook.py) was never invoked -- Stop did "
+        "not fire in -p mode"
+    )
+    seen = json.loads(seen_path.read_text(encoding="utf-8"))
+    assert seen["event"] == "Stop"
+    assert seen["agent"] == "harness-id-fixture:idcheck"
+
+    shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 @pytest.mark.timeout(300)  # exceeds the repo's global 60s default: real 240s poll budget below
 def test_live_wait_run_timeout_keeps_run_alive(live_server_params):
     if shutil.which("claude") is None:

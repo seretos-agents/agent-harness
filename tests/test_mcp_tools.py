@@ -1993,3 +1993,206 @@ def test_start_agent_can_spawn_follows_lib_default(
     mcp_config_b = json.loads(_flag(record_b["argv"], "--mcp-config"))
     assert "harness" not in mcp_config_a["mcpServers"], "canSpawn defaults false (lib v0.0.8)"
     assert "harness" in mcp_config_b["mcpServers"], "canSpawn: true must grant the dispatch server"
+
+
+# --- launched-agent identity (#51) -------------------------------------------------
+#
+# A harness-launched child is a fully independent top-level `claude` CLI process:
+# it has no equivalent of native Claude Code's own SubagentStop `agent_type` field,
+# and (until this ticket) no signal in its own environment either. These tests pin
+# HARNESS_LAUNCHED_AGENT (harness_plugin.runs.LAUNCHED_AGENT_ENV) as that signal, for
+# both a `harness_start_agent` child and a `harness_send_message` follow-up on it,
+# and its absence for a `harness_start_prompt` child (never any agent at all) --
+# including when the server process's own env happens to carry a stale value.
+
+
+def test_start_agent_exposes_launched_agent_env(
+    server_params, plugin_agent_install, project_dir, argv_log
+):
+    """R1: harness_start_agent(agent="agent-harness:probe") spawns a child whose env
+    has HARNESS_LAUNCHED_AGENT == "agent-harness:probe" -- the qualified name -- so a
+    hook running inside that child (e.g. its own Stop hook) can tell which agent it
+    is running as.
+
+    Expected RED reason: None != "agent-harness:probe" (fake_claude's own env carries
+    no HARNESS_LAUNCHED_AGENT at all today -- nothing sets it)."""
+    started, final = _start_and_finish(
+        server_params, agent="agent-harness:probe", cwd=str(project_dir), model="sonnet"
+    )
+    assert final["state"] == "COMPLETED"
+    (record,) = _argv_records(argv_log)
+    assert record["launched_agent"] == "agent-harness:probe"
+
+
+def test_start_agent_launched_agent_env_is_bare_name_for_project_agent(
+    server_params, project_dir, argv_log
+):
+    """R1 additional edge-case coverage: a project-scope agent (no plugin prefix)
+    reports its own bare name unqualified -- there is no colon to split off."""
+    started, final = _start_and_finish(
+        server_params, agent="demo", cwd=str(project_dir), model="sonnet"
+    )
+    assert final["state"] == "COMPLETED"
+    (record,) = _argv_records(argv_log)
+    assert record["launched_agent"] == "demo"
+
+
+def test_identity_provider_materialized_launch_uses_qualified_name(tmp_path):
+    """R1 additional edge-case coverage: a materialized-carrier launch (forced here
+    via accepted_keys=frozenset(), since RunSpec.prompt is always set and so is
+    never in an empty accepted set -- see dispatch_mode) must still set
+    HARNESS_LAUNCHED_AGENT to the run's qualified agent name ("p:a"), not the file
+    stem ("p__a") the materialized carrier's own --agent value uses.
+
+    Expected RED reason: None != "p:a" (_AgentIdentityProvider is still a plain
+    pass-through subclass; nothing sets the var on the plan's env yet)."""
+    from lib_python_harness import Isolation, RunSpec
+
+    from harness_plugin.runs import LAUNCHED_AGENT_ENV, _AgentIdentityProvider
+
+    provider = _AgentIdentityProvider()
+    spec = RunSpec(
+        prompt="Say OK.",
+        isolation=Isolation.INHERIT,
+        model="sonnet",
+        agent_name="p:a",
+        cwd=tmp_path,
+        allow_nonempty_cwd=True,
+    )
+    plan = provider.build_launch_plan(
+        spec, session_id="sess", run_dir=tmp_path, accepted_keys=frozenset()
+    )
+    assert plan.env.get(LAUNCHED_AGENT_ENV) == "p:a"
+
+
+def test_start_prompt_strips_inherited_launched_agent_env(server_params, argv_log):
+    """R2: harness_start_prompt (a CLEAN child, never any agent) must never carry
+    HARNESS_LAUNCHED_AGENT, even when the server process's own env happens to have
+    one set -- a CLEAN child inheriting a stale value from the parent process would
+    report a false identity.
+
+    Expected RED reason: "stale:parent" is not None (the server process's own env is
+    copied straight into the child's plan by _scrub_env(); nothing pops the var for
+    a CLEAN/no-agent launch today)."""
+    env = dict(server_params.env)
+    env["HARNESS_LAUNCHED_AGENT"] = "stale:parent"
+    params = server_params.model_copy(update={"env": env})
+
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session, "harness_start_prompt", prompt="Say OK.", model="sonnet"
+        )
+        assert not is_error, text
+        return started, await _poll_until_terminal(session, started["run_id"])
+
+    started, final = _run(scenario, params)
+    assert final["state"] == "COMPLETED"
+    (record,) = _argv_records(argv_log)
+    assert record["launched_agent"] is None
+
+
+def test_start_agent_overrides_stale_launched_agent_env(
+    server_params, plugin_agent_install, project_dir, argv_log
+):
+    """R2 additional edge-case coverage: the same stale server-env value does not
+    leak into an agent run either -- the child gets the actually-launched agent's
+    own name, not the stale value."""
+    env = dict(server_params.env)
+    env["HARNESS_LAUNCHED_AGENT"] = "stale:parent"
+    params = server_params.model_copy(update={"env": env})
+
+    started, final = _start_and_finish(
+        params, agent="agent-harness:probe", cwd=str(project_dir), model="sonnet"
+    )
+    assert final["state"] == "COMPLETED"
+    (record,) = _argv_records(argv_log)
+    assert record["launched_agent"] == "agent-harness:probe"
+
+
+def test_send_message_keeps_launched_agent_env(
+    server_params, plugin_agent_install, project_dir, argv_log
+):
+    """R3: harness_send_message on a finished agent run spawns a follow-up child
+    that still carries the origin run's own HARNESS_LAUNCHED_AGENT -- a follow-up
+    turn is still that same agent, so a Stop hook in the resumed child must see the
+    same identity the first turn did.
+
+    Expected RED reason: records[1]["launched_agent"] is None (build_resume_plan
+    replays the origin's argv, but nothing sets the identity env var on either the
+    first turn or the follow-up today)."""
+
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session,
+            "harness_start_agent",
+            agent="agent-harness:probe",
+            cwd=str(project_dir),
+            model="sonnet",
+        )
+        assert not is_error, text
+        origin = await _poll_until_terminal(session, started["run_id"])
+        sent = await _call(
+            session, "harness_send_message", run_id=origin["run_id"], prompt="ECHO:X"
+        )
+        assert not sent[0], sent[1]
+        follow_up = await _poll_until_terminal(session, sent[2]["run_id"])
+        return origin, follow_up
+
+    origin, follow_up = _run(scenario, server_params)
+    assert origin["state"] == "COMPLETED"
+    assert follow_up["state"] == "COMPLETED"
+    assert follow_up["text"] == "X"
+    records = _argv_records(argv_log)
+    assert len(records) == 2
+    assert records[1]["launched_agent"] == "agent-harness:probe"
+
+
+def test_identity_provider_build_resume_plan_recovers_name_from_materialized_argv(tmp_path):
+    """R3 additional edge-case coverage: a materialized-carrier origin's recorded
+    argv carries only the file-stem form of the agent name (--agent p__a, no
+    --agents payload) -- build_resume_plan must reverse the stem back to the
+    qualified name ("p:a") for the follow-up's own HARNESS_LAUNCHED_AGENT, per the
+    plan's documented `__` <-> `:` reversal (materialized carrier only; a bare
+    agent name that itself contains "__" is a known, documented limitation, not
+    something this test exercises)."""
+    from harness_plugin.runs import LAUNCHED_AGENT_ENV, _AgentIdentityProvider
+
+    provider = _AgentIdentityProvider()
+    argv = ["-p", "--model", "sonnet", "--agent", "p__a"]
+    plan = provider.build_resume_plan(
+        provider_argv=argv, session_id="sess", cwd=str(tmp_path), prompt="hi"
+    )
+    assert plan.env.get(LAUNCHED_AGENT_ENV) == "p:a"
+
+
+def test_identity_provider_build_resume_plan_keeps_verbatim_name_from_payload_argv(tmp_path):
+    """R3 additional edge-case coverage: a payload-carrier origin's recorded argv
+    carries --agents alongside --agent, so the --agent value is already the real
+    qualified name verbatim -- including a literal "__" that happens to be part of
+    the agent's own bare name -- and must not be reversed."""
+    from harness_plugin.runs import LAUNCHED_AGENT_ENV, _AgentIdentityProvider
+
+    provider = _AgentIdentityProvider()
+    argv = [
+        "-p", "--model", "sonnet",
+        "--agents", json.dumps({"my__agent": {"prompt": "hi"}}),
+        "--agent", "my__agent",
+    ]
+    plan = provider.build_resume_plan(
+        provider_argv=argv, session_id="sess", cwd=str(tmp_path), prompt="hi"
+    )
+    assert plan.env.get(LAUNCHED_AGENT_ENV) == "my__agent"
+
+
+def test_identity_provider_build_resume_plan_pops_env_for_prompt_origin(tmp_path):
+    """R3 additional edge-case coverage: a harness_start_prompt origin's recorded
+    argv has no --agent at all -- the follow-up must not carry any
+    HARNESS_LAUNCHED_AGENT, stale or otherwise."""
+    from harness_plugin.runs import LAUNCHED_AGENT_ENV, _AgentIdentityProvider
+
+    provider = _AgentIdentityProvider()
+    argv = ["-p", "--model", "sonnet"]
+    plan = provider.build_resume_plan(
+        provider_argv=argv, session_id="sess", cwd=str(tmp_path), prompt="hi"
+    )
+    assert LAUNCHED_AGENT_ENV not in plan.env
