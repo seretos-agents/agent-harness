@@ -353,15 +353,16 @@ jobs:
 
       # Tags created via GITHUB_TOKEN don't fire downstream push:tags workflows
       # (Actions blocks this to prevent recursive loops). Call both
-      # marketplaces directly with a separate PAT. The curated marketplace
-      # (modular-software-factory) opens a review PR; the staging marketplace
-      # (modular-software-factory-staging) commits straight to main. Same
-      # client_payload shape for both — the shared receiver-side action lives
-      # once in modular-software-factory-dev's .github/actions/update-registry.
+      # marketplaces directly with the org-wide ECOSYSTEM_TOKEN. The curated
+      # marketplace (modular-software-factory) opens a review PR; the staging
+      # marketplace (modular-software-factory-staging) commits straight to
+      # main. Same client_payload shape for both — the shared receiver-side
+      # action lives once in modular-software-factory-dev's
+      # .github/actions/update-registry, which also runs under ECOSYSTEM_TOKEN.
       - name: Dispatch to modular-software-factory (curated, PR review)
         shell: bash
         env:
-          GH_PAT:  ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
+          GH_PAT:  ${{ secrets.ECOSYSTEM_TOKEN }}
           VERSION: ${{ inputs.version }}
           NAME:    ${{ needs.stamp.outputs.plugin_name }}
           TAG:     ${{ needs.stamp.outputs.tag }}
@@ -390,7 +391,7 @@ jobs:
       - name: Dispatch to modular-software-factory-staging (direct)
         shell: bash
         env:
-          GH_PAT:  ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
+          GH_PAT:  ${{ secrets.ECOSYSTEM_TOKEN }}
           VERSION: ${{ inputs.version }}
           NAME:    ${{ needs.stamp.outputs.plugin_name }}
           TAG:     ${{ needs.stamp.outputs.tag }}
