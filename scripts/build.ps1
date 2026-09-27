@@ -4,10 +4,13 @@
 # Windows AND `pwsh` on Linux. Output extension is determined by the host
 # (.exe on Windows, no extension on Linux).
 #
-# Default OS_TARGETS = [windows, linux]. plugin.json points at the
-# extensionless `bin/harness`; each per-OS build job emits its own
-# native binary, and release.yml's assembly job merges both into a single
-# release zip so the host OS picks its native file at install time.
+# Default OS_TARGETS = [windows, linux]. Every launch point (hooks.json, both
+# MCP manifests) names the extensionless `bin/harness`; that name is now a
+# committed POSIX dispatcher (#53) that execs the real per-OS binary sitting
+# next to it -- `bin/harness.exe` on Windows, `bin/harness-linux` on Linux.
+# Each per-OS build job below emits its own native binary under the bin name
+# for its OS, and release.yml's assembly job merges the dispatcher plus both
+# binaries into a single release zip so every launcher resolves correctly.
 #
 # Usage (from plugin root):
 #   pwsh -File scripts/build.ps1
@@ -39,6 +42,12 @@ if ($null -eq (Get-Variable -Name IsWindows -ErrorAction SilentlyContinue)) {
 
 $ExeExt = if ($IsWindows) { ".exe" } else { "" }
 $ExeName = "harness$ExeExt"
+# The name PyInstaller produces (dist/$ExeName, unchanged) is not the name
+# this binary is shipped under in bin/ (#53): Windows keeps `harness.exe`,
+# but the Linux binary moves to `harness-linux` so the shared extensionless
+# name `bin/harness` is free for the committed POSIX dispatcher every launch
+# point actually names.
+$BinName = if ($IsWindows) { "harness.exe" } else { "harness-linux" }
 
 function Write-Step($msg) {
     Write-Host "==> $msg" -ForegroundColor Cyan
@@ -192,8 +201,10 @@ if (-not (Test-Path $exe)) {
 $exeSize = [math]::Round((Get-Item $exe).Length / 1MB, 1)
 Write-Host "    dist/$ExeName (${exeSize} MB)"
 
-# 5. Copy into bin/ where plugin.json expects it.
-Write-Step "Copying to bin/$ExeName"
+# 5. Copy into bin/ where the launch points expect it (#53: Linux ships as
+# `harness-linux`, not the extensionless `harness` -- that name is the
+# committed dispatcher, untouched by this build).
+Write-Step "Copying to bin/$BinName"
 New-Item -ItemType Directory -Force -Path "bin" | Out-Null
 
 if ($IsWindows) {
@@ -203,7 +214,7 @@ if ($IsWindows) {
     $copied = $false
     for ($i = 0; $i -lt 5; $i++) {
         try {
-            Copy-Item -Force $exe "bin/$ExeName" -ErrorAction Stop
+            Copy-Item -Force $exe "bin/$BinName" -ErrorAction Stop
             $copied = $true
             break
         } catch [System.IO.IOException] {
@@ -223,10 +234,10 @@ if ($IsWindows) {
         Fail "Could not copy dist/$ExeName to bin/ -- file remained locked."
     }
 } else {
-    Copy-Item -Force $exe "bin/$ExeName"
+    Copy-Item -Force $exe "bin/$BinName"
     # Linux binary needs the exec bit. PyInstaller already sets it on dist/,
     # but be explicit so a later `cp` without -p doesn't drop it.
-    chmod +x "bin/$ExeName"
+    chmod +x "bin/$BinName"
 }
 
 # 6. Smoke-test: MCP initialize handshake + tools/list.
@@ -239,7 +250,7 @@ $initMsg = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVer
 $initializedMsg = '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 $listMsg = '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 $psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = (Join-Path $root "bin/$ExeName")
+$psi.FileName = (Join-Path $root "bin/$BinName")
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 $psi.RedirectStandardInput = $true
@@ -280,45 +291,18 @@ if ($stdout -match '"result"' -and $stdout -match '"protocolVersion"' -and $stdo
     Fail "Handshake failed -- see output above."
 }
 
-# 6b. Smoke-test: the registered hook command string, run through the host shell.
-# Reads `command` from hooks/hooks.json verbatim (only ${CLAUDE_PLUGIN_ROOT} substituted)
-# and runs it via cmd.exe /c (Windows) or /bin/sh -c (Linux) with a PreToolUse payload on
-# stdin, proving the extensionless command word resolves to the frozen binary.
-Write-Step "Smoke-testing the registered hook command (via the OS shell)"
-$hooksJson = Get-Content -Raw (Join-Path $root "hooks/hooks.json") | ConvertFrom-Json
-$hookCmd = $hooksJson.hooks.PreToolUse[0].hooks[0].command
-$hookCmd = $hookCmd.Replace('${CLAUDE_PLUGIN_ROOT}', $root)
-$hookData = Join-Path ([System.IO.Path]::GetTempPath()) ("harness-hook-smoke-" + [guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Force -Path $hookData | Out-Null
-$hookIn = [System.IO.Path]::GetTempFileName()
-$hookPayload = '{"session_id":"build-smoke","cwd":"x","permission_mode":"acceptEdits","hook_event_name":"PreToolUse"}'
-[System.IO.File]::WriteAllBytes($hookIn, [System.Text.Encoding]::UTF8.GetBytes($hookPayload))
-$prevData = $env:CLAUDE_PLUGIN_DATA
-$env:CLAUDE_PLUGIN_DATA = $hookData
-try {
-    if ($IsWindows) {
-        $hookOut = & cmd.exe /c "$hookCmd < `"$hookIn`"" 2>&1
-    } else {
-        $hookOut = & /bin/sh -c "$hookCmd < '$hookIn'" 2>&1
-    }
-} finally {
-    $env:CLAUDE_PLUGIN_DATA = $prevData
-}
-$hookFile = Join-Path $hookData "sessions/build-smoke.json"
-if ((Test-Path $hookFile) -and ((Get-Content -Raw $hookFile) -match 'acceptEdits')) {
-    Write-Host "    hook command wrote sessions/build-smoke.json OK" -ForegroundColor Green
-} else {
-    Write-Host "    command: $hookCmd" -ForegroundColor Yellow
-    Write-Host "    output: $hookOut" -ForegroundColor Yellow
-    Fail "Hook smoke failed -- the registered hook command did not produce a session file. Fallback: add a bin/harness.exe hook entry."
-}
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $hookData, $hookIn
-
-# 6c. Smoke-test: the frozen binary's `wait` subcommand parses and documents itself.
+# 6b. Smoke-test: the frozen binary's `wait` subcommand parses and documents itself.
 # `--help` needs no run store; the full behaviour is exercised against this binary by the
 # HARNESS_BIN pytest step in test.yml.
+#
+# (The former 6b -- a cmd.exe/sh smoke of the registered hooks.json command --
+# was removed here (#53): cmd.exe is not the shell Claude Code actually uses
+# to run hooks on Windows (that is Git Bash), and this smoke never exercised
+# a two-OS bin/ layout in the first place. tests/test_launch_commands.py's
+# R1, run against a real frozen binary in test.yml's `build` job, replaces it
+# with a real Git-Bash/bash run of the verbatim hook command.)
 Write-Step "Smoke-testing the wait subcommand (--help)"
-$waitHelp = & (Join-Path $root "bin/$ExeName") wait --help 2>&1 | Out-String
+$waitHelp = & (Join-Path $root "bin/$BinName") wait --help 2>&1 | Out-String
 if ($LASTEXITCODE -eq 0 -and $waitHelp -match 'run_id' -and $waitHelp -match '--interval' -and $waitHelp -match 'exit codes') {
     Write-Host "    wait --help OK" -ForegroundColor Green
 } else {
@@ -351,4 +335,4 @@ if ($Package) {
 }
 
 Write-Step "Done."
-Write-Host "bin/$ExeName is ready. plugin.json points at the extensionless 'bin/harness' so each OS auto-selects its native binary."
+Write-Host "bin/$BinName is ready. Every launch point names the extensionless 'bin/harness' dispatcher, which execs this file on the matching OS."

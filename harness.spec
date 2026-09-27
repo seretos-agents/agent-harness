@@ -7,7 +7,9 @@
 #
 # Build:    pwsh -File scripts/build.ps1 -Clean
 # Output:   dist/harness.exe on Windows, dist/harness on Linux
-# Copy to:  bin/harness(.exe)  (handled by scripts/build.ps1)
+# Copy to:  bin/harness.exe (Windows) or bin/harness-linux (Linux), handled by
+#           scripts/build.ps1 -- bin/harness itself is a separate, committed
+#           POSIX dispatcher (#53), not PyInstaller output.
 
 # ruff: noqa
 from pathlib import Path

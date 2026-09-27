@@ -221,13 +221,16 @@ def test_hook_commands_via_bash_write_session_file(plugin_root, bash_exe, tmp_pa
     assert "acceptEdits" in session_file.read_text(encoding="utf-8")
 
 
-def test_hook_commands_share_one_launch_path():
-    """Additional edge-case coverage (already passes today): SessionStart and
-    PreToolUse register the identical command string, so R1's fix -- whatever
-    it is -- applies to both launch points at once."""
-    commands = {command for _, command in _HOOK_ENTRIES}
-    assert len(_HOOK_ENTRIES) == 2, _HOOK_ENTRIES
-    assert len(commands) == 1, "hook commands diverged -- no longer covered by one fix"
+# test_hook_commands_share_one_launch_path removed (test-critic round 1,
+# tautology::F1): it only asserted hooks.json's static JSON shape (two
+# entries, identical command strings), which the plan declares unchanged by
+# this fix -- no implementation, correct or wrong, could move that
+# assertion. test_hook_commands_via_bash_write_session_file above already
+# parametrizes over both the SessionStart and PreToolUse entries and proves
+# each one, run verbatim through bash, exits 0 and writes its session file
+# -- that is what actually demonstrates both hook entries share one working
+# launch path, RED today for the reported Exec format error and GREEN once
+# the dispatcher exists.
 
 
 # --- R2: MCP launch commands complete a real handshake -----------------------

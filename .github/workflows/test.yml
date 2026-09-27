@@ -87,14 +87,26 @@ jobs:
         with:
           python-version: "3.12"
 
+      # #53 R1/R2 (tests/test_launch_commands.py) drives the manifests'
+      # extensionless launch command through a real Node `child_process.spawn`
+      # -- Claude Code's own MCP launcher runtime and libuv path resolution.
+      # Node is a test-only dependency here; the dispatcher itself is /bin/sh.
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Build and smoke-test the binary
         shell: pwsh
         run: ${{ matrix.launcher }} -File scripts/build.ps1
 
-      - name: Run the wait tests against the frozen binary
+      - name: Run the wait + launch-command tests against the frozen binary
         shell: pwsh
         run: |
           python -m pip install -e ".[test]"
-          $bin = if ($IsWindows) { "bin/harness.exe" } else { "bin/harness" }
+          # #53: the bin/ name this build produced -- harness.exe on Windows,
+          # the renamed harness-linux on Linux (bin/harness itself is now the
+          # committed POSIX dispatcher, not build output).
+          $bin = if ($IsWindows) { "bin/harness.exe" } else { "bin/harness-linux" }
           $env:HARNESS_BIN = (Resolve-Path $bin).Path
-          python -m pytest tests/test_wait_run.py
+          python -m pytest tests/test_wait_run.py tests/test_launch_commands.py
