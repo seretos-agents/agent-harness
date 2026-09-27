@@ -293,6 +293,113 @@ def _handshake_tool_names(command: str, args: list[str], cwd: str) -> set[str]:
     return {t.name for t in tools}
 
 
+def _pretooluse_groups() -> list[dict]:
+    """`hooks.json`'s `PreToolUse` groups, read verbatim from the repo file."""
+    data = json.loads((REPO / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    return data["hooks"].get("PreToolUse", [])
+
+
+def _matcher_selects(matcher: str, tool_name: str) -> bool:
+    """Claude Code's own matcher rule (see plan #52 "Premises verified"): a
+    matcher made up only of `[A-Za-z0-9_|]` is an exact pipe-separated name
+    list; anything else is tested with an *unanchored* `re.search`, so e.g.
+    `mcp__.*harness.*` also matches any tool name containing that substring
+    anywhere, not just a full match."""
+    if re.fullmatch(r"[A-Za-z0-9_|]+", matcher or ""):
+        return tool_name in matcher.split("|")
+    return re.search(matcher, tool_name) is not None
+
+
+def _commands_selected_for(tool_name: str) -> list[str]:
+    commands = []
+    for group in _pretooluse_groups():
+        if _matcher_selects(group.get("matcher", ""), tool_name):
+            commands.extend(hook["command"] for hook in group["hooks"])
+    return commands
+
+
+def _run_pretooluse_command(command: str, plugin_root: Path, tmp_path: Path, bash_exe: str, tool_name: str):
+    plugin_data = tmp_path / "plugin-data"
+    plugin_data.mkdir(exist_ok=True)
+    stdin_payload = json.dumps(
+        {
+            "session_id": f"native-{tool_name}",
+            "cwd": str(plugin_root),
+            "permission_mode": "bypassPermissions",
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool_name,
+            "tool_input": {},
+        }
+    )
+    env = {
+        **os.environ,
+        "CLAUDE_PLUGIN_ROOT": plugin_root.as_posix(),
+        "CLAUDE_PLUGIN_DATA": str(plugin_data),
+    }
+    return subprocess.run(
+        [bash_exe, "-c", command],
+        input=stdin_payload,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+
+
+# --- #52 R3: hooks.json routes Agent/Task to a deny, verbatim through bash --
+
+
+@pytest.mark.parametrize("tool_name", ["Agent", "Task"])
+def test_native_subagent_hook_command_denies(plugin_root, bash_exe, tmp_path, tool_name):
+    """R3: every hooks.json PreToolUse group whose matcher selects `tool_name`
+    under Claude Code's own matcher rule (`_matcher_selects` above), run
+    verbatim through a real bash against the release-shaped `plugin_root`,
+    must print the hook's deny JSON on stdout.
+
+    Expected RED reason: no PreToolUse matcher in hooks.json selects `Agent`
+    or `Task` today -- the group-selection assertion below fails first, with
+    "no hooks.json PreToolUse group routes {tool_name}"."""
+    commands = _commands_selected_for(tool_name)
+    assert commands, f"no hooks.json PreToolUse group routes {tool_name}"
+
+    for command in commands:
+        result = _run_pretooluse_command(command, plugin_root, tmp_path, bash_exe, tool_name)
+        assert result.returncode == 0, (
+            f"bash exited {result.returncode} running {command!r} for tool_name={tool_name!r}; "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        try:
+            parsed = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            pytest.fail(
+                f"stdout for {tool_name!r} did not parse as JSON: {exc}; "
+                f"stdout={result.stdout!r} stderr={result.stderr!r}"
+            )
+        hook_output = parsed.get("hookSpecificOutput", {})
+        assert hook_output.get("permissionDecision") == "deny", (
+            f"expected a deny decision for {tool_name!r}, got {parsed!r}"
+        )
+
+
+def test_harness_tool_hook_command_not_denied(plugin_root, bash_exe, tmp_path):
+    """Non-regression guard alongside R3: the group(s) selected for the
+    existing harness MCP tool name must not print a deny.
+
+    Expected RED reason: none -- may already pass; guards against an
+    over-broad matcher or deny branch."""
+    tool_name = "mcp__harness__harness_start_agent"
+    commands = _commands_selected_for(tool_name)
+    assert commands, f"expected an existing hooks.json PreToolUse group to route {tool_name}"
+
+    for command in commands:
+        result = _run_pretooluse_command(command, plugin_root, tmp_path, bash_exe, tool_name)
+        assert result.returncode == 0, (
+            f"bash exited {result.returncode} running {command!r}; "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        assert "deny" not in result.stdout, result.stdout
+
+
 @pytest.mark.parametrize("spec_id", ["claude-plugin", "mcp-json"])
 def test_mcp_launch_command_handshake(plugin_root, spec_id):
     """R2: the manifest's launch command, resolved and spawned by real Node
