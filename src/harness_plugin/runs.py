@@ -3,6 +3,7 @@
 Deliberately free of mcp/FastMCP imports: the subcommand must start without them."""
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -10,9 +11,68 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from lib_python_harness import FileRunStore, Harness, HarnessError
+from lib_python_harness import ClaudeCliProvider, FileRunStore, Harness, HarnessError
 
 _HARNESS: Harness | None = None
+
+# Public contract name (#51): the env var a `harness_start_agent` child (and any
+# `harness_send_message` follow-up on it) finds its own qualified agent name under,
+# so a hook running inside that child -- e.g. its own `Stop` hook -- can tell which
+# agent it is running as. See README.md's "Agent identity inside a run" section.
+LAUNCHED_AGENT_ENV = "HARNESS_LAUNCHED_AGENT"
+
+
+def _with_identity(env: dict[str, str], name: str | None) -> dict[str, str]:
+    """`env` (a `LaunchPlan.env`, never mutated in place) with `LAUNCHED_AGENT_ENV`
+    set to `name` when truthy, or popped otherwise. The pop branch matters even
+    though `_scrub_env()` only ever copies the *current* process's own env: a
+    server running inside an agent session would otherwise leak its own identity
+    into a CLEAN `harness_start_prompt` child, or a resumed `harness_send_message`
+    follow-up on a prompt-origin run would inherit a stale value."""
+    env = dict(env)
+    if name:
+        env[LAUNCHED_AGENT_ENV] = name
+    else:
+        env.pop(LAUNCHED_AGENT_ENV, None)
+    return env
+
+
+def _recover_launched_agent_name(provider_argv: list[str]) -> str | None:
+    """The origin run's own qualified agent name, recovered from its recorded
+    argv -- the only per-run carrier `build_resume_plan` receives. No `--agent`
+    means the origin was a `harness_start_prompt` (CLEAN, no agent) run: `None`.
+    With `--agents` present (the payload carrier), `--agent`'s value is already
+    the qualified name verbatim (`_build_agent_payload`/`dispatch_mode`, plan
+    Approach) -- used as-is, so a bare agent name that itself contains `__`
+    (e.g. `my__agent`) is not mistaken for a materialized stem. Without
+    `--agents` (the materialized carrier, last resort), `--agent`'s value is
+    the file stem `_agent_file_stem` wrote (`:` replaced by `__`), reversed here
+    with a single replacement -- the one documented, known-ambiguous case is a
+    materialized-carrier agent whose own bare name contains `__` (README)."""
+    agent = _flag(provider_argv, "--agent")
+    if agent is None:
+        return None
+    if "--agents" in provider_argv:
+        return agent
+    return agent.replace("__", ":", 1)
+
+
+class _AgentIdentityProvider(ClaudeCliProvider):
+    """Wraps `ClaudeCliProvider` to inject `LAUNCHED_AGENT_ENV` into a launched
+    child's (and its resumed follow-ups') environment (#51). `RunSpec` has no
+    `env` field, `LaunchPlan` is frozen and `_scrub_env` is internal, so this
+    injected provider is v0.0.8's only per-run override point; `ClaudeCliProvider`
+    itself is stateless, so subclassing it carries no extra state to manage."""
+
+    def build_launch_plan(self, spec, **kwargs):
+        plan = super().build_launch_plan(spec, **kwargs)
+        return dataclasses.replace(plan, env=_with_identity(plan.env, spec.agent_name))
+
+    def build_resume_plan(self, *, provider_argv, **kwargs):
+        plan = super().build_resume_plan(provider_argv=provider_argv, **kwargs)
+        name = _recover_launched_agent_name(provider_argv)
+        return dataclasses.replace(plan, env=_with_identity(plan.env, name))
+
 
 # Init-event key(s) each announced category may be spelled under, primary spelling
 # first. NOTE: only `mcp_servers` carries a known alternate spelling (`mcpServers`) --
@@ -259,7 +319,11 @@ def harness() -> Harness:
     """Lazy singleton: poll/wait/stop depend on the in-process Popen map."""
     global _HARNESS
     if _HARNESS is None:
-        _HARNESS = Harness(store=FileRunStore(artifacts_root()), claude_argv=claude_argv())
+        _HARNESS = Harness(
+            store=FileRunStore(artifacts_root()),
+            claude_argv=claude_argv(),
+            provider=_AgentIdentityProvider(),
+        )
     return _HARNESS
 
 

@@ -193,7 +193,11 @@ def harness_start_agent(
     run's task (the user message); the agent definition's body stays the system prompt.
     Without `prompt` the run gets a default task. The run's MCP-server set is the parent
     session's own (project, user/local, enabled plugins, harness), rebuilt explicitly and
-    passed to the launch rather than left for the child to discover on its own."""
+    passed to the launch rather than left for the child to discover on its own. The child's
+    own environment carries `HARNESS_LAUNCHED_AGENT=<qualified_name>` (and so does any
+    `harness_send_message` follow-up on it), so a hook running inside it -- e.g. its own
+    `Stop` hook -- can tell which agent it is running as; see README.md's "Agent identity
+    inside a run" section."""
     if prompt is not None and not prompt.strip():
         raise HarnessError("prompt must not be empty")
     data, source = load_session_context()
