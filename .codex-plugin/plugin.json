@@ -1,0 +1,14 @@
+{
+  "name": "agent-harness",
+  "version": "0.0.3",
+  "description": "Provider-independent subagent system for coding agents - replaces the host's built-in subagent tool calls.",
+  "author": {
+    "name": "Arne von Appen"
+  },
+  "repository": "https://github.com/seretos-agents/agent-harness",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Agent Harness",
+    "shortDescription": "Provider-independent subagent system for coding agents - replaces the host's built-in subagent tool calls."
+  }
+}
