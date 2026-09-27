@@ -2184,12 +2184,17 @@ def test_identity_provider_build_resume_plan_keeps_verbatim_name_from_payload_ar
     assert plan.env.get(LAUNCHED_AGENT_ENV) == "my__agent"
 
 
-def test_identity_provider_build_resume_plan_pops_env_for_prompt_origin(tmp_path):
+def test_identity_provider_build_resume_plan_pops_env_for_prompt_origin(tmp_path, monkeypatch):
     """R3 additional edge-case coverage: a harness_start_prompt origin's recorded
     argv has no --agent at all -- the follow-up must not carry any
-    HARNESS_LAUNCHED_AGENT, stale or otherwise."""
+    HARNESS_LAUNCHED_AGENT, stale or otherwise. The process env is seeded with a
+    stale value first (build_resume_plan's base env comes from `_scrub_env()`,
+    which copies `os.environ`) so this actually exercises the pop -- without the
+    seed, the assertion would hold vacuously on a pytest process that never had
+    the var set in the first place."""
     from harness_plugin.runs import LAUNCHED_AGENT_ENV, _AgentIdentityProvider
 
+    monkeypatch.setenv(LAUNCHED_AGENT_ENV, "stale:leftover")
     provider = _AgentIdentityProvider()
     argv = ["-p", "--model", "sonnet"]
     plan = provider.build_resume_plan(
