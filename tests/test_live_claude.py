@@ -17,6 +17,8 @@ from test_mcp_tools import _call, _poll_until_terminal, _run, _session
 
 pytestmark = pytest.mark.live
 
+REPO = Path(__file__).resolve().parents[1]
+
 
 @pytest.mark.timeout(300)  # exceeds the repo's global 60s default: real 240s poll budget below
 def test_live_start_agent_prompt_becomes_user_message(live_server_params, tmp_path):
@@ -970,3 +972,159 @@ def test_live_wait_run_timeout_keeps_run_alive(live_server_params):
         assert waited[2]["duration_s"] > 0
     assert waited[2]["state"] != "CANCELLED"
     assert final["state"] == "COMPLETED"
+
+
+# --- native subagent dispatch denied at the tool-call boundary, live (#52 R4) ------
+
+
+def _tool_result_text(block: dict) -> str:
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(parts)
+    return ""
+
+
+@pytest.mark.timeout(300)
+def test_live_native_subagent_dispatch_denied():
+    """R4: a real `claude -p` session, with the plugin's hooks installed via a
+    fixture plugin, refuses Claude Code's native Agent/Task subagent dispatch
+    at the tool-call boundary -- the ticket's actual consumer.
+
+    Self-provisions like test_live_launched_agent_visible_to_plugin_stop_hook:
+    a short tempfile.mkdtemp root, a copied .credentials.json (skipped if
+    absent or `claude` is not on PATH), and a real `claude plugin marketplace
+    add` / `install harness-deny-fixture@lt -y` under an isolated
+    CLAUDE_CONFIG_DIR. The fixture plugin carries this repo's hooks/hooks.json
+    verbatim plus a fixture `bin/harness` sh script
+    (`exec "<sys.executable>" -m harness_plugin "$@"`) standing in for the
+    frozen binary -- accepted as a proceed per plan-critic round 2 (R3 already
+    covers the frozen-binary path separately, in bash).
+
+    Expected RED reason: today the Agent/Task tool_use's tool_result is a
+    normal (non-error) subagent result, not the hook's denial. If the model
+    never emits the tool_use at all, this test fails loudly with the full
+    stream-json dump, never skips."""
+    if shutil.which("claude") is None:
+        pytest.skip("the real `claude` CLI is not on PATH")
+    real_credentials = _real_credentials_path()
+    if not real_credentials.is_file():
+        pytest.skip(f"no real credentials at {real_credentials}; cannot run a live child")
+
+    tmp_path = Path(tempfile.mkdtemp(prefix="ah52-"))
+    config_dir = tmp_path / "claude-config"
+    project_dir = tmp_path / "live-project"
+    project_dir.mkdir(parents=True)
+    config_dir.mkdir(parents=True)
+    shutil.copy(real_credentials, config_dir / ".credentials.json")
+
+    marketplace_dir = tmp_path / "marketplace"
+    fixture_dir = marketplace_dir / "harness-deny-fixture"
+    (fixture_dir / "hooks").mkdir(parents=True)
+    shutil.copy2(REPO / "hooks" / "hooks.json", fixture_dir / "hooks" / "hooks.json")
+
+    bin_dir = fixture_dir / "bin"
+    bin_dir.mkdir(parents=True)
+    harness_sh = bin_dir / "harness"
+    with open(harness_sh, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(f'#!/bin/sh\nexec "{Path(sys.executable).as_posix()}" -m harness_plugin "$@"\n')
+    if sys.platform != "win32":
+        harness_sh.chmod(0o755)
+
+    _write_json(
+        fixture_dir / ".claude-plugin" / "plugin.json",
+        {"name": "harness-deny-fixture", "hooks": "./hooks/hooks.json"},
+    )
+    _write_json(
+        marketplace_dir / ".claude-plugin" / "marketplace.json",
+        {
+            "name": "lt",
+            "owner": {"name": "R4 live fixture"},
+            "metadata": {"version": "0.0.0", "description": "R4 live fixture marketplace"},
+            "plugins": [
+                {
+                    "name": "harness-deny-fixture",
+                    "description": "R4 live fixture: this repo's own hooks/hooks.json verbatim",
+                    "source": "./harness-deny-fixture",
+                    "category": "other",
+                    "version": "0.0.0",
+                },
+            ],
+        },
+    )
+
+    setup_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_dir)}
+    added = subprocess.run(
+        ["claude", "plugin", "marketplace", "add", str(marketplace_dir)],
+        capture_output=True, text=True, timeout=60, env=setup_env,
+    )
+    assert added.returncode == 0, f"marketplace add failed: {added.stdout} {added.stderr}"
+    installed = subprocess.run(
+        ["claude", "plugin", "install", "harness-deny-fixture@lt", "-y"],
+        capture_output=True, text=True, timeout=60, env=setup_env,
+    )
+    assert installed.returncode == 0, f"install failed: {installed.stdout} {installed.stderr}"
+
+    run_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_dir)}
+    proc = subprocess.run(
+        [
+            "claude", "-p",
+            "Use the Agent tool to launch the general-purpose subagent with the prompt "
+            "'say OK'. Do nothing else.",
+            "--model", "haiku",
+            "--permission-mode", "bypassPermissions",
+            "--output-format", "stream-json",
+            "--verbose",
+        ],
+        capture_output=True, text=True, timeout=280, env=run_env, cwd=str(project_dir),
+    )
+
+    tool_use_id = None
+    tool_result_block = None
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        message = entry.get("message") or {}
+        for block in message.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if tool_use_id is None and block.get("type") == "tool_use" and block.get("name") in ("Agent", "Task"):
+                tool_use_id = block.get("id")
+            elif (
+                tool_use_id
+                and tool_result_block is None
+                and block.get("type") == "tool_result"
+                and block.get("tool_use_id") == tool_use_id
+            ):
+                tool_result_block = block
+
+    assert tool_use_id is not None, (
+        "the model never emitted a native Agent/Task tool_use; full stream-json "
+        f"dump:\nstdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+    )
+    assert tool_result_block is not None, (
+        f"no tool_result found for the Agent/Task tool_use {tool_use_id!r}; "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert tool_result_block.get("is_error") is True, (
+        f"expected the native subagent dispatch to be denied (is_error), got "
+        f"{tool_result_block!r}"
+    )
+    result_text = _tool_result_text(tool_result_block)
+    assert "harness_start_agent" in result_text, (
+        f"deny message missing harness_start_agent: {result_text!r}"
+    )
+
+    shutil.rmtree(tmp_path, ignore_errors=True)

@@ -92,3 +92,83 @@ def test_unwritable_sessions_dir_exits_zero(tmp_path):
     blocker.write_text("occupied", encoding="utf-8")  # mkdir under a file must fail
     proc = run_hook(json.dumps(PRE_TOOL_USE), blocker)
     assert proc.returncode == 0, proc.stderr
+
+
+# --- #52: native Agent/Task subagent dispatch is denied at PreToolUse -------
+
+_NATIVE_SUBAGENT_TOOLS = ("Agent", "Task")
+
+
+def _native_pre_tool_use(tool_name):
+    payload = dict(PRE_TOOL_USE)
+    payload["tool_name"] = tool_name
+    return payload
+
+
+@pytest.mark.parametrize("tool_name", _NATIVE_SUBAGENT_TOOLS)
+def test_native_subagent_tool_is_denied(tmp_path, tool_name):
+    """R1: a PreToolUse payload naming the native `Agent` tool (or its legacy
+    `Task` alias) is denied via the CLI's real hookSpecificOutput deny shape.
+
+    Expected RED reason: stdout is empty today (the hook has no deny branch),
+    so json.loads("") raises JSONDecodeError."""
+    proc = run_hook(json.dumps(_native_pre_tool_use(tool_name)), tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    try:
+        parsed = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        pytest.fail(f"stdout did not parse as JSON: {exc}; stdout={proc.stdout!r} stderr={proc.stderr!r}")
+    hook_output = parsed["hookSpecificOutput"]
+    assert hook_output["hookEventName"] == "PreToolUse"
+    assert hook_output["permissionDecision"] == "deny"
+    reason = hook_output["permissionDecisionReason"]
+    assert "harness_start_agent" in reason
+    assert "harness_start_prompt" in reason
+
+
+@pytest.mark.parametrize("tool_name", _NATIVE_SUBAGENT_TOOLS)
+def test_deny_survives_unwritable_sessions_dir(tmp_path, tool_name):
+    """Additional edge-case coverage for R1: even when the session-context
+    write itself cannot happen (sessions dir blocked by a file), the deny
+    output is still produced -- the deny print must not depend on the write's
+    own try/except succeeding.
+
+    Expected RED reason: same as test_native_subagent_tool_is_denied -- no
+    deny branch exists yet."""
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("occupied", encoding="utf-8")
+    proc = run_hook(json.dumps(_native_pre_tool_use(tool_name)), blocker)
+    assert proc.returncode == 0, proc.stderr
+    try:
+        parsed = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        pytest.fail(f"stdout did not parse as JSON: {exc}; stdout={proc.stdout!r} stderr={proc.stderr!r}")
+    assert parsed["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_harness_tool_not_denied(tmp_path):
+    """R2 (non-regression guard): the existing `mcp__harness__harness_start_agent`
+    PreToolUse payload produces no permissionDecision on stdout, and the
+    session file is still written.
+
+    Expected RED reason: none -- this guards against an over-broad deny
+    branch and may already pass against unfixed code."""
+    proc = run_hook(json.dumps(PRE_TOOL_USE), tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "deny" not in proc.stdout, proc.stdout
+    written = tmp_path / "sessions" / "sess-abc.json"
+    assert written.is_file(), f"no session file; stdout={proc.stdout!r} stderr={proc.stderr!r}"
+
+
+def test_harness_prompt_tool_not_denied(tmp_path):
+    """R2: a plugin-qualified harness tool name (`harness_start_prompt`) is
+    likewise not denied and still writes the session file.
+
+    Expected RED reason: none -- may already pass."""
+    payload = dict(PRE_TOOL_USE)
+    payload["tool_name"] = "mcp__plugin_agent-harness_harness__harness_start_prompt"
+    proc = run_hook(json.dumps(payload), tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "deny" not in proc.stdout, proc.stdout
+    written = tmp_path / "sessions" / "sess-abc.json"
+    assert written.is_file(), f"no session file; stdout={proc.stdout!r} stderr={proc.stderr!r}"
