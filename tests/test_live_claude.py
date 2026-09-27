@@ -1128,3 +1128,148 @@ def test_live_native_subagent_dispatch_denied():
     )
 
     shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+# --- #62 R5: a real tool_response shape is tracked, live ---------------------
+
+
+@pytest.mark.timeout(300)
+def test_live_stop_hook_tracks_started_run():
+    """R5: a real `claude -p` session with this plugin's own hooks.json AND
+    its own MCP server installed (fixture template:
+    `test_live_native_subagent_dispatch_denied`, extended with `mcpServers`
+    so the session can actually call `harness_start_prompt`) calls
+    `harness_start_prompt`, `harness_wait_run`s the result, then finishes.
+    The PostToolUse hook (once implemented) must have written a
+    `tracked-runs/` marker for the run_id the harness server's own run store
+    (HARNESS_ARTIFACTS_DIR, pinned to this test's own tmp dir) recorded --
+    proving premise 1 (the real `tool_response` shape) live, since it
+    cannot be checked offline (plan "Premises verified" #1).
+
+    The Stop block itself is not asserted here -- R1 in test_hook.py already
+    covers Stop's exit-2 behaviour against a synthetic marker + record; this
+    test only proves PostToolUse actually produces a real marker from a
+    real tool_response, in a real session.
+
+    Where CLAUDE_PLUGIN_DATA actually lands for this fixture plugin is
+    computed by the real CLI itself (per-plugin, under CLAUDE_CONFIG_DIR --
+    see host_context.py's own `parent_mcp_servers` docstring, which mirrors
+    the same convention for a dispatched child); this test does not
+    hardcode that path but searches for a `tracked-runs/` directory
+    anywhere under `config_dir`.
+
+    Expected RED reason: no PostToolUse hook exists yet, so no
+    `tracked-runs/` directory is ever created anywhere under `config_dir`."""
+    if shutil.which("claude") is None:
+        pytest.skip("the real `claude` CLI is not on PATH")
+    real_credentials = _real_credentials_path()
+    if not real_credentials.is_file():
+        pytest.skip(f"no real credentials at {real_credentials}; cannot run a live child")
+
+    tmp_path = Path(tempfile.mkdtemp(prefix="ah62-"))
+    config_dir = tmp_path / "claude-config"
+    project_dir = tmp_path / "live-project"
+    project_dir.mkdir(parents=True)
+    config_dir.mkdir(parents=True)
+    shutil.copy(real_credentials, config_dir / ".credentials.json")
+
+    artifacts_dir = tmp_path / "artifacts"
+
+    marketplace_dir = tmp_path / "marketplace"
+    fixture_dir = marketplace_dir / "harness-stop-fixture"
+    (fixture_dir / "hooks").mkdir(parents=True)
+    shutil.copy2(REPO / "hooks" / "hooks.json", fixture_dir / "hooks" / "hooks.json")
+
+    bin_dir = fixture_dir / "bin"
+    bin_dir.mkdir(parents=True)
+    harness_sh = bin_dir / "harness"
+    with open(harness_sh, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(f'#!/bin/sh\nexec "{Path(sys.executable).as_posix()}" -m harness_plugin "$@"\n')
+    if sys.platform != "win32":
+        harness_sh.chmod(0o755)
+
+    _write_json(
+        fixture_dir / ".claude-plugin" / "plugin.json",
+        {
+            "name": "harness-stop-fixture",
+            "hooks": "./hooks/hooks.json",
+            "mcpServers": {
+                "harness": {
+                    "command": sys.executable,
+                    "args": ["-m", "harness_plugin"],
+                    "env": {"HARNESS_ARTIFACTS_DIR": str(artifacts_dir)},
+                }
+            },
+        },
+    )
+    _write_json(
+        marketplace_dir / ".claude-plugin" / "marketplace.json",
+        {
+            "name": "lt",
+            "owner": {"name": "R5 live fixture"},
+            "metadata": {"version": "0.0.0", "description": "R5 live fixture marketplace"},
+            "plugins": [
+                {
+                    "name": "harness-stop-fixture",
+                    "description": "R5 live fixture: this repo's own hooks.json + MCP server",
+                    "source": "./harness-stop-fixture",
+                    "category": "mcp",
+                    "version": "0.0.0",
+                },
+            ],
+        },
+    )
+
+    setup_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_dir)}
+    added = subprocess.run(
+        ["claude", "plugin", "marketplace", "add", str(marketplace_dir)],
+        capture_output=True, text=True, timeout=60, env=setup_env,
+    )
+    assert added.returncode == 0, f"marketplace add failed: {added.stdout} {added.stderr}"
+    installed = subprocess.run(
+        ["claude", "plugin", "install", "harness-stop-fixture@lt", "-y"],
+        capture_output=True, text=True, timeout=60, env=setup_env,
+    )
+    assert installed.returncode == 0, f"install failed: {installed.stdout} {installed.stderr}"
+
+    run_env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config_dir)}
+    proc = subprocess.run(
+        [
+            "claude", "-p",
+            "Use the harness_start_prompt tool with the prompt 'reply ok', then call "
+            "harness_wait_run on the returned run_id repeatedly until it reports a "
+            "terminal state, then reply DONE. Do nothing else.",
+            "--model", "haiku",
+            "--permission-mode", "bypassPermissions",
+            "--output-format", "stream-json",
+            "--verbose",
+        ],
+        capture_output=True, text=True, timeout=280, env=run_env, cwd=str(project_dir),
+    )
+    assert proc.returncode == 0, (
+        f"claude -p exited {proc.returncode}; stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+
+    started_run_ids = (
+        {record_dir.name for record_dir in artifacts_dir.iterdir() if (record_dir / "record.json").is_file()}
+        if artifacts_dir.is_dir()
+        else set()
+    )
+    assert started_run_ids, (
+        f"harness_start_prompt never created a run record under {artifacts_dir}; "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+
+    tracked_run_ids: set[str] = set()
+    for tracked_dir in config_dir.rglob("tracked-runs"):
+        if not tracked_dir.is_dir():
+            continue
+        for session_dir in tracked_dir.iterdir():
+            if session_dir.is_dir():
+                tracked_run_ids |= {p.name for p in session_dir.iterdir()}
+    assert started_run_ids & tracked_run_ids, (
+        f"no tracked-runs/ marker for any started run {started_run_ids}; "
+        f"found tracked run(s): {tracked_run_ids}; searched under {config_dir}"
+    )
+
+    shutil.rmtree(tmp_path, ignore_errors=True)

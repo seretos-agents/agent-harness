@@ -233,6 +233,101 @@ def test_hook_commands_via_bash_write_session_file(plugin_root, bash_exe, tmp_pa
 # the dispatcher exists.
 
 
+# --- #62 R1: hooks.json's Stop command blocks, verbatim through bash --------
+
+
+def _post_tool_use_groups() -> list[dict]:
+    """`hooks.json`'s `PostToolUse` groups, read verbatim from the repo file."""
+    data = json.loads((REPO / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    return data["hooks"].get("PostToolUse", [])
+
+
+def _post_tool_use_commands_selected_for(tool_name: str) -> list[str]:
+    commands = []
+    for group in _post_tool_use_groups():
+        if _matcher_selects(group.get("matcher", ""), tool_name):
+            commands.extend(hook["command"] for hook in group["hooks"])
+    return commands
+
+
+def _stop_commands() -> list[str]:
+    """Every `hooks.json` `Stop` hook command, read verbatim from the repo
+    file (`Stop` groups carry no matcher -- they fire for every session)."""
+    data = json.loads((REPO / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    commands = []
+    for group in data["hooks"].get("Stop", []):
+        commands.extend(hook["command"] for hook in group["hooks"])
+    return commands
+
+
+def test_stop_hook_command_blocks(plugin_root, bash_exe, tmp_path):
+    """#62 R1: hooks.json's verbatim PostToolUse command (for a start tool)
+    tracks a started run, then its verbatim Stop command blocks (exit 2)
+    while that run's record.json is RUNNING -- both run through a real bash
+    against the release-shaped `plugin_root` (template:
+    `test_native_subagent_hook_command_denies`).
+
+    Expected RED reason: hooks.json has no `Stop` entry today, so
+    `assert stop_commands, "no hooks.json Stop hook command exists"` fails
+    first."""
+    stop_commands = _stop_commands()
+    assert stop_commands, "no hooks.json Stop hook command exists"
+
+    post_commands = _post_tool_use_commands_selected_for("mcp__harness__harness_start_agent")
+    assert post_commands, (
+        "no hooks.json PostToolUse group routes mcp__harness__harness_start_agent"
+    )
+
+    from lib_python_harness import FileRunStore, RunState
+
+    plugin_data = tmp_path / "plugin-data"
+    plugin_data.mkdir()
+    artifacts_dir = tmp_path / "artifacts"
+    session_id = "native-stop-1"
+    run_id = "run-native-stop"
+
+    FileRunStore(str(artifacts_dir)).put(run_id, {"run_id": run_id, "state": RunState.RUNNING})
+
+    env = {
+        **os.environ,
+        "CLAUDE_PLUGIN_ROOT": plugin_root.as_posix(),
+        "CLAUDE_PLUGIN_DATA": str(plugin_data),
+        "HARNESS_ARTIFACTS_DIR": str(artifacts_dir),
+    }
+
+    post_stdin = json.dumps(
+        {
+            "session_id": session_id,
+            "cwd": str(plugin_root),
+            "hook_event_name": "PostToolUse",
+            "tool_name": "mcp__harness__harness_start_agent",
+            "tool_input": {},
+            "tool_response": {"run_id": run_id},
+        }
+    )
+    for command in post_commands:
+        result = subprocess.run(
+            [bash_exe, "-c", command], input=post_stdin, capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert result.returncode == 0, (
+            f"bash exited {result.returncode} running PostToolUse command {command!r}; "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+
+    stop_stdin = json.dumps(
+        {"session_id": session_id, "cwd": str(plugin_root), "hook_event_name": "Stop"}
+    )
+    for command in stop_commands:
+        result = subprocess.run(
+            [bash_exe, "-c", command], input=stop_stdin, capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert result.returncode == 2, (
+            f"bash exited {result.returncode} running Stop command {command!r}; "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        assert run_id in result.stderr
+
+
 # --- R2: MCP launch commands complete a real handshake -----------------------
 
 
