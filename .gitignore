@@ -13,10 +13,15 @@ dist/
 .idea/
 
 # PyInstaller output — produced locally by scripts/build.ps1 and
-# shipped to end users via GitHub Releases, not the repo. Whole
-# bin/ tree so the Linux-side `bin/harness` (no extension) is
-# also covered, not just the Windows .exe.
-/bin/
+# shipped to end users via GitHub Releases, not the repo. Ignore
+# everything under bin/ (the Windows .exe and the renamed Linux
+# binary bin/harness-linux) EXCEPT bin/harness itself: that name is
+# a committed POSIX dispatcher (#53), not build output — every
+# launch point (hooks.json, both MCP manifests) names it directly,
+# so it must ship from a bare dev checkout too, not just from
+# release.yml's staging copy.
+/bin/*
+!/bin/harness
 *.pyinstaller.tmp/
 .adev/
 .serena/

@@ -106,13 +106,19 @@ Compare a reading against the one before it:
 
 ## Finding the binary
 
-The plugin ships `bin/harness` (Linux) and `bin/harness.exe` (Windows). Resolve it without
-relying on placeholder substitution - take the first of these that yields a path:
+The plugin ships `bin/harness-linux` (Linux) and `bin/harness.exe` (Windows), plus a
+committed `bin/harness` POSIX dispatcher that `exec`s whichever of those two matches the
+host - every launch point (hooks, both MCP manifests) names that extensionless `bin/harness`
+directly. Resolve it without relying on placeholder substitution - take the first of these
+that yields a path:
 
 1. `command -v harness.exe || command -v harness` - works when the plugin `bin/` is on
    PATH. Ask for `harness.exe` first, as written: on Windows the bare name fails with exit
-   126 or 127.
-2. Glob the plugin cache: `~/.claude/plugins/**/agent-harness*/bin/harness*`.
+   126 or 127. On Linux this resolves to the dispatcher, which `exec`s `harness-linux` in
+   place (same PID), so invoking it is no different from invoking the real binary directly.
+2. Glob the plugin cache: `~/.claude/plugins/**/agent-harness*/bin/harness*` - matches the
+   dispatcher and both native binaries; prefer an exact `harness.exe`/`harness` match over
+   `harness-linux` so step 1's Windows-first-then-dispatcher order still holds.
 
 Pass the same environment the MCP server runs with, in particular `HARNESS_ARTIFACTS_DIR`
 if it is set - the command finds runs through the shared artifacts directory. If it is not

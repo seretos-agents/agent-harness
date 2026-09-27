@@ -17,17 +17,24 @@ name: release
 #               PR, staging modular-software-factory-staging directly).
 #
 # .claude-plugin/plugin.json uses an extensionless
-# `command: ${CLAUDE_PLUGIN_ROOT}/bin/harness` — the host OS auto-resolves to
-# `harness.exe` on Windows and `harness` on Linux, so a single zip serves
-# both platforms. .codex-plugin/plugin.json points at the root `.mcp.json`
-# (`"mcpServers": "./.mcp.json"`) instead of declaring the server inline,
-# because Codex fails to load an inline extensionless launcher command; the
-# assemble job below ships `.mcp.json` onto the staging tree as a hard
-# (non-optional) copy so that reference always resolves.
+# `command: ${CLAUDE_PLUGIN_ROOT}/bin/harness` — every launch point (both
+# hooks.json commands too) names that same extensionless path. Since #53,
+# what actually ships at that name is a committed POSIX dispatcher (bin/
+# harness, mode 100755) that execs `bin/harness.exe` under Git Bash/MSYS or
+# `bin/harness-linux` otherwise: native Windows spawners (Node/libuv, Rust's
+# std::process) never run the literal extensionless file, they append
+# .com/.exe and land on harness.exe directly, but a POSIX shell (Linux, or
+# Git Bash running a hooks.json command on Windows) executes whatever sits at
+# that name literally. .codex-plugin/plugin.json points at the root
+# `.mcp.json` (`"mcpServers": "./.mcp.json"`) instead of declaring the server
+# inline, because Codex fails to load an inline extensionless launcher
+# command; the assemble job below ships `.mcp.json` onto the staging tree as
+# a hard (non-optional) copy so that reference always resolves.
 #
 # Windows-only override: if this plugin is genuinely Win32-bound (COM / pyvda
 # / pywin32 etc.), drop the ubuntu-22.04 row from the matrix below, remove
-# the Linux-binary assertions in the assemble job, and revert
+# the Linux-binary/dispatcher assertions in the assemble job (including the
+# `harness-linux` merge and the dispatcher's Linux exec branch), and revert
 # .claude-plugin/plugin.json's command back to `bin/harness.exe`. See
 # AGENTS.md "OS_TARGETS".
 
@@ -225,7 +232,7 @@ jobs:
 
           # Merge every per-OS bin payload. Each build job uploads to
           # bins/bin-<os>/ which contains the OS-specific binary
-          # (`harness.exe` from Windows, `harness` from Linux).
+          # (`harness.exe` from Windows, `harness-linux` from Linux).
           mkdir -p "$STAGE/bin"
           shopt -s nullglob
           for d in bins/bin-*/; do
@@ -233,28 +240,38 @@ jobs:
             cp -a "$d"/* "$STAGE/bin/"
           done
 
+          # The committed POSIX dispatcher (#53) is not produced by either
+          # per-OS build job -- it is a tracked file every launch point
+          # (hooks.json, both MCP manifests) names directly. Copy it from the
+          # stamped source tree explicitly rather than relying on it having
+          # ridden along inside a per-OS bin-*/ artifact.
+          cp -a stamped/bin/harness "$STAGE/bin/harness"
+
           echo "=== merged bin/ ==="
           ls -la "$STAGE/bin"
 
-          # Assert both binaries got picked up. Drop one of these branches
-          # if you reduce OS_TARGETS to a single OS.
+          # Assert the dispatcher and both binaries got picked up. Drop the
+          # Linux-related assertions if you reduce OS_TARGETS to a single OS.
+          if [ ! -f "$STAGE/bin/harness" ]; then
+            echo "::error::missing bin/harness dispatcher in merged stage"; exit 1
+          fi
           if [ ! -f "$STAGE/bin/harness.exe" ]; then
             echo "::error::missing Windows binary in merged stage"; exit 1
           fi
-          if [ ! -f "$STAGE/bin/harness" ]; then
+          if [ ! -f "$STAGE/bin/harness-linux" ]; then
             echo "::error::missing Linux binary in merged stage"; exit 1
           fi
-          chmod +x "$STAGE/bin/harness"
+          chmod +x "$STAGE/bin/harness" "$STAGE/bin/harness-linux"
 
           ZIP="dist/agent-harness-${{ inputs.version }}.zip"
           mkdir -p dist
           # Use Python's zipfile so we can stamp Unix mode bits into the
-          # central directory — required so the Linux binary keeps its
-          # exec bit after `unzip` on Linux/macOS.
+          # central directory — required so the dispatcher and the Linux
+          # binary keep their exec bit after `unzip` on Linux/macOS.
           python3 - "$STAGE" "$ZIP" <<'PY'
           import os, sys, time, zipfile
           stage, zip_path = sys.argv[1], sys.argv[2]
-          EXECS = {"bin/harness", "bin/harness.exe"}
+          EXECS = {"bin/harness", "bin/harness.exe", "bin/harness-linux"}
           EXE_ATTR = (0o755 << 16) | 0x8000  # S_IFREG | 0755
           REG_ATTR = (0o644 << 16) | 0x8000
           with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -325,11 +342,14 @@ jobs:
           echo "=== release branch contents ==="
           find . -mindepth 1 -not -path './.git*' | sort
 
-          # Stamp +x on both binaries so a Linux clone of the orphan release
-          # branch yields executable files (matters for WSL/Linux installs).
-          git add bin/harness.exe bin/harness
+          # Stamp +x on the dispatcher and both binaries so a Linux clone of
+          # the orphan release branch yields executable files (matters for
+          # WSL/Linux installs and for the dispatcher, which every launch
+          # point runs directly through a POSIX shell).
+          git add bin/harness.exe bin/harness bin/harness-linux
           git update-index --chmod=+x bin/harness.exe
           git update-index --chmod=+x bin/harness
+          git update-index --chmod=+x bin/harness-linux
           git add -A
           git commit -m "release: v${{ inputs.version }}"
           git push origin release --force

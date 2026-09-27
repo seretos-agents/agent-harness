@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import anyio
@@ -248,23 +249,40 @@ _PYTHON3 = shutil.which("python3")
     "the ubuntu row of test.yml exercises it on every PR",
 )
 def test_release_staging_ships_mcp_json(tmp_path):
-    """R3: the real 'Build merged staging tree' script (release.yml), run
-    against a throwaway copy of this repo plus faked per-OS binaries, produces
-    `build/stage/agent-harness/.mcp.json`, byte-identical to the repo's own
-    `.mcp.json`.
+    """R3 (#46 R1-R4) + #53 R3: the real 'Build merged staging tree' script
+    (release.yml), run against a throwaway copy of this repo plus faked
+    per-OS binaries, produces `build/stage/agent-harness/.mcp.json`,
+    byte-identical to the repo's own `.mcp.json`; and (#53) merges the
+    committed `bin/harness` dispatcher plus both OS binaries into
+    `stage/bin/` with the dispatcher and the Linux binary carrying the exec
+    bit in the built zip.
 
-    Expected RED reason: the script exits 0 (it doesn't fail on a missing
-    optional file) but `stage/.mcp.json` is absent -- nothing in the script
-    copies it yet.
+    Per-OS bin payloads use the #53 bin/ layout contract: `bin-windows/`
+    holds `harness.exe`, `bin-linux/` holds `harness-linux` (renamed from the
+    old extensionless `harness` so that name is free for the dispatcher).
+    `stamped/bin/harness` is copied from the real `REPO/bin/harness` --
+    ignored (not copied) by the wholesale `shutil.copytree` above, the same
+    way the real `stamp` job's checkout carries the committed dispatcher
+    alongside the gitignored build output.
+
+    Expected RED reason: `REPO/bin/harness` does not exist yet
+    (FileNotFoundError) -- the dispatcher (#53) is not implemented in this
+    phase. Once it exists but release.yml is unchanged, the script fails on
+    the missing `harness-linux` merge/assert or its exec bit.
     """
+    dispatcher = REPO / "bin" / "harness"
+    dispatcher_bytes = dispatcher.read_bytes()  # FileNotFoundError today (#53 not implemented yet).
+
     stamped = tmp_path / "stamped"
     ignore = shutil.ignore_patterns(".git", ".venv", "bin", "build", "dist", "__pycache__", ".adev")
     shutil.copytree(REPO, stamped, ignore=ignore)
+    (stamped / "bin").mkdir(parents=True, exist_ok=True)
+    (stamped / "bin" / "harness").write_bytes(dispatcher_bytes)
 
     (tmp_path / "bins" / "bin-windows").mkdir(parents=True)
     (tmp_path / "bins" / "bin-windows" / "harness.exe").write_bytes(b"fake-windows-binary")
     (tmp_path / "bins" / "bin-linux").mkdir(parents=True)
-    (tmp_path / "bins" / "bin-linux" / "harness").write_bytes(b"fake-linux-binary")
+    (tmp_path / "bins" / "bin-linux" / "harness-linux").write_bytes(b"fake-linux-binary")
 
     github_output = tmp_path / "github_output.txt"
     github_output.write_text("", encoding="utf-8")
@@ -297,6 +315,26 @@ def test_release_staging_ships_mcp_json(tmp_path):
     assert resolved == staged_mcp.resolve()
     resolved_data = json.loads(resolved.read_text(encoding="utf-8"))
     assert resolved_data["mcpServers"]["harness"]["command"] == "./bin/harness"
+
+    # #53 R3: stage/bin holds exactly the dispatcher plus both OS binaries,
+    # and the dispatcher is byte-identical to the repo's committed one --
+    # not just present under that name.
+    staged_bin_names = {p.name for p in (stage / "bin").iterdir()}
+    assert staged_bin_names == {"harness", "harness.exe", "harness-linux"}, staged_bin_names
+    assert (stage / "bin" / "harness").read_bytes() == dispatcher_bytes
+
+    # #53 R3: the built release zip carries the exec bit on the dispatcher
+    # and the Linux binary (not the Windows .exe, which needs none).
+    zip_path = tmp_path / "dist" / "agent-harness-0.0.0-test.zip"
+    assert zip_path.is_file(), f"release zip missing after staging script ran (exit 0); dist={list((tmp_path / 'dist').iterdir()) if (tmp_path / 'dist').is_dir() else 'MISSING'}"
+    with zipfile.ZipFile(zip_path) as zf:
+        modes = {
+            info.filename: (info.external_attr >> 16) & 0o777
+            for info in zf.infolist()
+            if info.filename in {"bin/harness", "bin/harness.exe", "bin/harness-linux"}
+        }
+    assert modes.get("bin/harness") == 0o755, modes
+    assert modes.get("bin/harness-linux") == 0o755, modes
 
 
 # --- R4: Claude resolution ignores the new root .mcp.json -------------------

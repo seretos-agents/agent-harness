@@ -11,7 +11,7 @@ Provider-independent subagent system for coding agents - replaces the host's bui
 /plugin install agent-harness@modular-software-factory
 ```
 
-Self-contained binary — no Python, no `pip install`, no dependencies. The release zip ships native binaries for both Windows (`harness.exe`) and Linux (`harness`); the host OS auto-selects the right one.
+Self-contained binary — no Python, no `pip install`, no dependencies. The release zip ships native binaries for both Windows (`harness.exe`) and Linux (`harness-linux`), plus a small committed dispatcher (`harness`) that every launch point actually names; each launcher resolves to the right native file for its OS.
 
 ## Alternative installs
 
@@ -44,7 +44,7 @@ cd agent-harness
 pwsh -File scripts/build.ps1 -Clean -Package
 ```
 
-Output on Windows: `bin/harness.exe`. On Linux: `bin/harness`. Then install via `/plugin install <path>`.
+Output on Windows: `bin/harness.exe`. On Linux: `bin/harness-linux`. The committed `bin/harness` dispatcher (already in the repo) execs whichever one matches the host. Then install via `/plugin install <path>`.
 
 ## Waiting for a long run: `harness wait <run_id>`
 
