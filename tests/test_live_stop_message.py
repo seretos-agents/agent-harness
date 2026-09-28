@@ -200,11 +200,28 @@ def _blind_prompt(directive: str) -> str:
 
 
 def _run_stop_message_scenario(project_dir: Path, run_env: dict[str, str], directive: str):
+    # #65 round-2 FAIL (live): a captured trial showed the model, right after its one
+    # `harness_start_prompt` call, calling the CLI's own built-in `ScheduleWakeup`
+    # tool (delaySeconds/noop/reason/prompt) in a loop with `harness_poll_run` --
+    # 21 ScheduleWakeup calls, 22 polls, zero Stop-hook blocks (no `hook_event:
+    # "Stop"` entry anywhere in stdout) -- instead of ever ending its turn. That is
+    # the exact self-polling-around-the-wait-mechanism failure mode #65 exists to
+    # prevent, just via a CLI tool `_blind_prompt`'s prose ("do not call any other
+    # tool of any kind") apparently did not read as covering, rather than via
+    # `harness_wait_run` or a shell workaround (the two things this module already
+    # detects). Because it lets the model avoid ending its turn at all, the Stop
+    # hook (and hooks/stop_wait_message.md's wording) never even gets invoked in
+    # such a trial -- no wording change could fix this, so it is denied here at the
+    # CLI level (deterministic, unlike further prose tightening) rather than by
+    # touching the shipped message. Denying it does not narrow what these scenarios
+    # exercise: neither R1 nor R2's directives need the model to defer its own
+    # reactivation -- that is exactly the job the Stop hook already does.
     return subprocess.run(
         [
             "claude", "-p", _blind_prompt(directive),
             "--model", "haiku",
             "--permission-mode", "bypassPermissions",
+            "--disallowedTools", "ScheduleWakeup",
             "--output-format", "stream-json",
             "--verbose",
         ],
