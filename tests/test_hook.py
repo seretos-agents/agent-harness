@@ -5,7 +5,6 @@ hooks.json runs the frozen binary."""
 import contextlib
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -1031,24 +1030,82 @@ def test_stop_message_rendered_from_file(tmp_path):
 
 STOP_MARKER = "agent-harness Stop hook: waited for unfinished run(s)"
 
+# tautology::F1 (test-critic round 2 -- critical): the round-2 version of this test
+# only pinned the rendered message against generic keyword/regex checks ("exactly
+# once" present, a "do not/don't/never abort" regex, "until they are terminal"
+# absent). A paraphrased rewrite that still tells the agent to self-poll under
+# different wording -- e.g. prepending STOP_MARKER onto a message that says "poll
+# harness_poll_run precisely one time per turn, then keep calling harness_wait_run
+# until the run finishes" -- would satisfy every one of those checks while still
+# breaking the ticket's actual requirement. Since the developer who writes this test
+# is the same developer who will write hooks/stop_wait_message.md's real content in
+# the implement phase, the only assertion that cannot be gamed by a paraphrase is an
+# exact match against the *specific* final wording committed to here, now, before
+# the implementation exists -- the same pattern test_stop_message_rendered_from_file
+# already uses successfully (there via random markers substituted per-run; here via
+# a fixed literal since the real committed file's content, not an arbitrary swapped
+# template, is what must match).
+#
+# This is the literal content #65 commits hooks/stop_wait_message.md to. Every
+# clause in it is required by plan #65's Approach section: the fixed STOP_MARKER
+# first line: "First line is the fixed marker ... then {run_ids}"; "do not abort; no
+# harness_wait_run, no harness wait shell, no polling loop -- the hook waits again
+# whenever you end your turn"; "Per run: harness_poll_run exactly once. Terminal ->
+# use result, continue."; the "advanced since your earlier reading" working rule;
+# the "first silent reading" one-wait-of-grace rule; and the "second consecutive
+# silent reading ... stalled: harness_stop_run(run_id), end with a report (run_id,
+# last_activity, last_event_at, 'cancelled as stalled')" escalation rule.
+EXPECTED_MESSAGE_TEMPLATE = (
+    "agent-harness Stop hook: waited for unfinished run(s) {run_ids}\n"
+    "\n"
+    "This is expected, not an error. Do not abort. Do not call harness_wait_run, "
+    "and do not run `harness wait` in a shell -- do not poll in a loop of any "
+    "kind. The hook will wait again automatically whenever you end your turn.\n"
+    "\n"
+    "For each run listed above:\n"
+    "1. Call harness_poll_run exactly once. If the run is terminal, use its "
+    "result and continue your work.\n"
+    "2. If the run is RUNNING and its event_count or last_event_at has advanced "
+    "since your last reading of it (your last poll, or the harness_start_prompt "
+    "/ harness_start_agent response if this is your first reading), it is "
+    "working: end your turn now and make no further calls.\n"
+    "3. If the run is RUNNING, unchanged since your last reading, and its "
+    "last_activity is a call that can legitimately run long (a shell command, a "
+    "build, a test run, an install, or a sub-agent), and this is the first "
+    "silent reading in a row for this run: give it the benefit of the doubt and "
+    "end your turn now (one wait of grace).\n"
+    "4. If this is the second consecutive silent reading for this run, or "
+    "last_activity cannot plausibly take a full wait, treat it as stalled: call "
+    "harness_stop_run(run_id), then end your turn with a short report naming "
+    "the run_id, last_activity, last_event_at, and \"cancelled as stalled\" so "
+    "a higher level can decide what to do next.\n"
+)
+
 
 def test_stop_sends_committed_message_file(tmp_path):
     """R3 driving test: a real Stop subprocess, blocked on one tracked RUNNING run,
     renders the *actual committed* hooks/stop_wait_message.md (not a swapped-in
     template like test_stop_message_rendered_from_file uses) -- stderr is exactly
-    that file's `{run_ids}` placeholder filled in with `run-x (RUNNING)`, and starts
-    with the fixed STOP_MARKER prefix #65 introduces.
+    that file's `{run_ids}` placeholder filled in with `run-x (RUNNING)`, and the
+    committed file's own text equals EXPECTED_MESSAGE_TEMPLATE above verbatim (not
+    just "contains the marker" or "contains some keywords") -- the specific final
+    wording #65 commits to, decided before the implementation exists.
 
-    Expected RED reason: the current committed file starts with "agent-harness:
-    run(s) {run_ids} started in this session are not finished; call harness_wait_run
-    / harness_poll_run until they are terminal, or harness_stop_run to cancel,
-    before ending the turn." -- `stop.stderr.startswith(STOP_MARKER)` fails on
-    unfixed code."""
+    Expected RED reason: the current committed file reads "agent-harness: run(s)
+    {run_ids} started in this session are not finished; call harness_wait_run /
+    harness_poll_run until they are terminal, or harness_stop_run to cancel, before
+    ending the turn.\\n" -- `template == EXPECTED_MESSAGE_TEMPLATE` fails first (the
+    two strings differ from the first word: "agent-harness:" vs "agent-harness Stop
+    hook:")."""
     message_path = REPO / "hooks" / "stop_wait_message.md"
     template = message_path.read_text(encoding="utf-8")
     assert template.count("{run_ids}") == 1, (
         f"expected exactly one {{run_ids}} placeholder in {message_path}, "
         f"found {template.count('{run_ids}')}"
+    )
+    assert template == EXPECTED_MESSAGE_TEMPLATE, (
+        f"hooks/stop_wait_message.md does not match the exact final wording #65 "
+        f"commits to; got={template!r} expected={EXPECTED_MESSAGE_TEMPLATE!r}"
     )
 
     plugin_data = tmp_path / "plugin-data"
@@ -1063,34 +1120,11 @@ def test_stop_sends_committed_message_file(tmp_path):
     stop = run_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=extra_env)
     assert stop.returncode == 2, f"stdout={stop.stdout!r} stderr={stop.stderr!r}"
 
-    expected = template.replace("{run_ids}", f"{run_id} (RUNNING)").strip()
+    expected = EXPECTED_MESSAGE_TEMPLATE.replace("{run_ids}", f"{run_id} (RUNNING)").strip()
     assert stop.stderr.strip() == expected, (
         f"stderr does not match the committed file rendered with run_ids filled in; "
         f"stderr={stop.stderr!r} expected={expected!r}"
     )
     assert stop.stderr.startswith(STOP_MARKER), (
         f"stderr does not start with the fixed STOP_MARKER prefix; stderr={stop.stderr!r}"
-    )
-
-    # tautology::F1 (test-critic round 2): the equality check above only proves the
-    # hook renders *some* content from the committed file -- a file that merely
-    # prepends STOP_MARKER in front of the old self-polling wording ("call
-    # harness_wait_run / harness_poll_run until they are terminal") would satisfy
-    # every assertion above it (equality is against the file's own content, and
-    # startswith only needs the prefix). Pin the rendered content to what the plan
-    # actually commits to instead: the removed self-polling instruction is gone
-    # (plan "Mechanism balance" > Removed), and the new exactly-once / don't-abort
-    # guidance the plan's Approach commits to is present.
-    lower = stop.stderr.lower()
-    assert "until they are terminal" not in lower, (
-        "message must not keep the old 'call harness_wait_run / harness_poll_run "
-        f"until they are terminal' self-polling instruction; stderr={stop.stderr!r}"
-    )
-    assert "exactly once" in lower, (
-        "message must tell the agent to call harness_poll_run exactly once per "
-        f"reactivation (plan Approach); stderr={stop.stderr!r}"
-    )
-    assert re.search(r"(do not|don't|never)\s+abort", lower), (
-        "message must explicitly tell the agent not to abort (plan Approach: "
-        f"'do not abort'); stderr={stop.stderr!r}"
     )

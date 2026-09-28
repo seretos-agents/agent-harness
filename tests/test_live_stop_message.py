@@ -130,10 +130,17 @@ def _blind_prompt(directive: str) -> str:
     stderr feedback (hooks/stop_wait_message.md), which is exactly what these
     scenarios exist to prove -- coaching the model here about polling/waiting would
     make a self-polling old-wording run pass this test for the wrong reason."""
+    # tautology::F5: earlier wording told the model to include the run's run_id in
+    # its own summary, which made `run_id in final_text` (R2, below) hold no matter
+    # what hooks/stop_wait_message.md says about reporting -- the check was primed
+    # by the prompt, not by the hook's escalation-report instruction. The prompt
+    # asks only for "a summary", so R2's `run_id in final_text` now has a real
+    # source: it can only be satisfied by the model following the hook message's
+    # own "end with a report naming the run_id ..." instruction (plan Approach).
     return (
         f"Use the harness_start_prompt tool with the prompt {directive!r} to start a "
         "job, then end your turn. Once you have the job's final result, reply with a "
-        "short one-line summary of it that includes the run's run_id, and stop."
+        "short one-line summary of it, and stop."
     )
 
 
@@ -355,10 +362,19 @@ def test_live_stalled_run_escalates_and_ends(tmp_path, trial):
     the second consecutive silent reading; the final reply names the run_id. Never
     more than one poll per block, never harness_wait_run.
 
+    tautology::F3 (test-critic round 3): the plan's own timeline is exact, not a
+    range -- segment 0 reads advanced (the Bash tool_use event already landed by
+    the first poll, see the F2 comment below), the first silent reading gets grace,
+    the second silent reading cancels. That is exactly 3 segments, not "3 to 4" --
+    a looser `3 <= blocks <= 4` bound would let a message that gives *two* waits of
+    grace (cancelling on the third silent reading, 4 blocks) pass despite breaking
+    the plan's stated threshold ("tolerated silence = one hook wait, two if
+    last_activity is a long-running call"). Pin to exactly 3.
+
     Expected RED reason: hooks/stop_wait_message.md has no stall/grace rule at all
     today (and carries no STOP_MARKER, so block detection itself may match zero
     blocks) -- a subagent following the old wording either self-polls indefinitely
-    (harness_wait_run appears, or the run is still pending well past the 4-block
+    (harness_wait_run appears, or the run is still pending well past the 3-block
     ceiling this test allows) or never cancels at all, so
     `stop_calls_per_segment.count(True) == 1` fails."""
     _skip_unless_live_available()
@@ -370,10 +386,6 @@ def test_live_stalled_run_escalates_and_ends(tmp_path, trial):
     assert blocks, (
         f"zero Stop-hook blocks matched (marker {STOP_MARKER!r} never seen in "
         f"stdout); full dump: stdout={proc.stdout!r} stderr={proc.stderr!r}"
-    )
-    assert len(blocks) <= 4, (
-        f"too many blocks ({len(blocks)}) -- expected escalation well before this "
-        f"many silent readings: {blocks}"
     )
 
     stop_calls_per_segment = []
@@ -395,32 +407,33 @@ def test_live_stalled_run_escalates_and_ends(tmp_path, trial):
         f"expected exactly one harness_stop_run call across all segments, got "
         f"{stop_calls_per_segment.count(True)}: {stop_calls_per_segment}"
     )
-    assert stop_calls_per_segment[-1], (
-        f"harness_stop_run must happen in the last segment (the second consecutive "
-        f"silent reading), not earlier: {stop_calls_per_segment}"
-    )
-    # tautology::F2: segment 0 is *not* the first silent reading. The
-    # harness_start_prompt response already carries event_count/last_event_at
-    # (runs.py's run_to_dict includes them unconditionally, and harness_start_prompt
-    # returns run_to_dict(result) with no override -- server.py), so it is the
-    # model's "earlier reading" baseline from the very start. By the time the first
-    # poll happens (after #64's internal wait), the fake job's one Bash tool_use
-    # event has already landed, so segment 0 reads as *advanced* against that
-    # baseline ("working", plan Approach) -- not silent. The first genuinely silent
-    # reading (unchanged since segment 0, Bash still the last_activity, one wait of
-    # grace) is segment -2; escalation happens on the second consecutive silent
-    # reading, segment -1. Assert there are enough segments for that timeline to
-    # have actually happened, and check grace at the real first-silent index
-    # instead of index 0.
-    assert len(blocks) >= 3, (
-        f"expected at least 3 segments: one 'advanced' reading right after the Bash "
+    # tautology::F2 (test-critic round 3): segment 0 is *not* the first silent
+    # reading. The harness_start_prompt response already carries
+    # event_count/last_event_at (runs.py's run_to_dict includes them
+    # unconditionally, and harness_start_prompt returns run_to_dict(result) with no
+    # override -- server.py), so it is the model's "earlier reading" baseline from
+    # the very start. By the time the first poll happens (after #64's internal
+    # wait), the fake job's one Bash tool_use event has already landed, so segment 0
+    # reads as *advanced* against that baseline ("working", plan Approach) -- not
+    # silent. The first genuinely silent reading (unchanged since segment 0, Bash
+    # still the last_activity, one wait of grace) is segment 1; escalation happens
+    # on the second consecutive silent reading, segment 2 -- exactly 3 segments
+    # (tautology::F3, docstring above).
+    #
+    # A per-segment `stop_calls_per_segment[-1]` / `not stop_calls_per_segment[-2]`
+    # position check would add nothing beyond this count + exact-length check
+    # (test-critic round 3, F4/F2): once harness_stop_run succeeds the run is
+    # CANCELLED (terminal), so the Stop hook cannot block again -- if the single
+    # True in stop_calls_per_segment sat anywhere before the last of exactly 3
+    # segments, no further segments could exist at all, contradicting
+    # `len(blocks) == 3`. So "exactly one True, exactly 3 segments" already forces
+    # the stop into the last segment and forces the first silent reading (segment
+    # 1) to have been given grace; checking position directly would be implied by,
+    # not independent of, these two.
+    assert len(blocks) == 3, (
+        f"expected exactly 3 segments: one 'advanced' reading right after the Bash "
         f"tool_use event, one silent reading given grace, and the second silent "
         f"reading that escalates; got {len(blocks)}: {stop_calls_per_segment}"
-    )
-    assert not stop_calls_per_segment[-2], (
-        f"harness_stop_run must not happen on the first silent reading (one wait of "
-        f"grace, plan Approach) -- segment {len(blocks) - 2} is the first genuinely "
-        f"silent reading, not segment 0: {stop_calls_per_segment}"
     )
 
     assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
@@ -432,13 +445,12 @@ def test_live_stalled_run_escalates_and_ends(tmp_path, trial):
     assert len(started) == 1, f"expected exactly one run started, got {started}"
     run_id = next(iter(started))
 
-    # tautology::F3: `run_id in final_text` alone is self-fulfilling -- the blind
-    # prompt (`_blind_prompt` above) explicitly asks the model to echo the run_id in
-    # its own one-line summary, so this held even for a hook message with no report
-    # instruction at all. Ground the check in independent evidence instead: the
-    # harness_stop_run tool call captured from the real escalation segment must
-    # itself have been invoked with the actually-started run_id -- evidence from
-    # what the model's tool call did, not from what it chose to say afterwards.
+    # tautology::F3 (test-critic round 2): `run_id in final_text` alone is
+    # self-fulfilling if the prompt itself asks the model to echo the run_id.
+    # Ground the check in independent evidence too: the harness_stop_run tool call
+    # captured from the real escalation segment must itself have been invoked with
+    # the actually-started run_id -- evidence from what the model's tool call did,
+    # not from what it chose to say afterwards.
     escalation_start = blocks[-1]
     stop_inputs = _tool_use_inputs(lines, escalation_start, len(lines), "harness_stop_run")
     assert stop_inputs, (
@@ -450,6 +462,15 @@ def test_live_stalled_run_escalates_and_ends(tmp_path, trial):
         f"{run_id!r} (independent evidence from the real tool call, not the "
         f"model's self-reported summary text); stop_inputs={stop_inputs!r}"
     )
+    # tautology::F5 (test-critic round 3): round 2's `run_id in final_text` check
+    # was still primed -- `_blind_prompt` explicitly asked the model to include the
+    # run_id in its summary, so this held even for a hook message with no report
+    # instruction at all. `_blind_prompt` (above) now asks only for "a short
+    # one-line summary", dropping that instruction, so the only remaining source
+    # that can put the run_id into final_text is the hook message's own escalation
+    # report instruction ("end with a report naming the run_id ...", plan
+    # Approach) -- this assertion is now real evidence that the message drives the
+    # report, not an echo of the prompt.
     assert run_id in final_text, f"final reply does not name the run_id {run_id!r}: {final_text!r}"
     assert _record_state(artifacts_dir, run_id) == "CANCELLED", (
         f"run {run_id}'s record never reached CANCELLED: "
