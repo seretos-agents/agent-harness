@@ -14,6 +14,15 @@ There is no opt-out. A companion PreToolUse guard denies
 path (see plan "Premises verified" #5) that could otherwise delete a live
 run's record and let a stale marker read as "gone" at Stop.
 
+#64: the Stop branch no longer takes a single snapshot. It polls the real
+`record.json` for every tracked run, every `_POLL_INTERVAL_SECONDS`, until
+either all are terminal (exit 0) or `stop_wait_timeout()` (env
+`HARNESS_STOP_WAIT_TIMEOUT_SECONDS`, default/ceiling 7200s) elapses (exit 2,
+same as before). A timeout never cancels a run. A run already seen
+non-terminal stays "pending" (sticky) across a transient read failure,
+rather than a corrupt/racing read being read as "gone" mid-wait; a run that
+cannot be read on its very first check is still excluded, matching #62.
+
 Never blocks the parent's tool call outside those two intentional guards:
 any other failure exits 0 having written nothing. The deny/block branches
 run outside the fail-open try/except that guards the generic per-event
@@ -24,9 +33,18 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
+from collections.abc import Mapping
 from pathlib import Path
 
-from harness_plugin.host_context import PROJECT_ENV, _safe_name, artifacts_root, sessions_dir, write_session_context
+from harness_plugin.host_context import (
+    PROJECT_ENV,
+    _safe_name,
+    artifacts_root,
+    sessions_dir,
+    stop_wait_timeout,
+    write_session_context,
+)
 
 _KEYS = ("session_id", "cwd", "permission_mode", "effort", "model", "transcript_path")
 
@@ -47,6 +65,14 @@ _START_TOOLS = frozenset({"harness_start_agent", "harness_start_prompt", "harnes
 _CLEANUP_TOOL = "harness_cleanup_run"
 
 _TERMINAL = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
+
+# #64: how often the Stop branch re-reads every tracked run's record.json
+# while waiting for it to go terminal. `harness wait --interval` is a CLI
+# argument of a different process (nothing here to reuse); this one is fixed,
+# not configurable -- only the overall deadline (stop_wait_timeout()) is.
+_POLL_INTERVAL_SECONDS = 0.5
+
+_STOP_WAIT_MESSAGE_FILENAME = "stop_wait_message.md"
 
 
 def _deny(reason: str) -> None:
@@ -155,29 +181,58 @@ def _run_state(run_id: str) -> str | None:
     return None
 
 
-def _pending_runs(session_id: object) -> list[tuple[str, str]]:
-    """[(run_id, state)] for every run tracked under `session_id` whose
-    state was read successfully and is not terminal. A run whose state
-    could not be read at all (missing/corrupt record) fails open -- it is
-    silently excluded, never treated as pending -- per test-critic round 2
-    note #1, re-read fresh on every call: nothing here is cached across
+def _pending_runs(
+    session_id: object, sticky: Mapping[str, str] | None = None
+) -> list[tuple[str, str]]:
+    """[(run_id, state)] for every run tracked under `session_id` that is not
+    terminal, re-read fresh on every call (nothing here is cached across
     Stop invocations, so a run that later goes terminal is re-checked and
-    correctly stops blocking on the very next Stop."""
+    correctly stops blocking).
+
+    `sticky` (#64) is the caller's own previous return value, reshaped into a
+    `{run_id: state}` mapping (see `main()`'s poll loop): when a read fails
+    (missing/corrupt/racing record), a run already known non-terminal from an
+    earlier pass keeps that last-known state instead of the read failure
+    being treated as "gone" -- a single glitch mid-wait must not end the
+    block early. A run whose very first read fails still has nothing in
+    `sticky` yet, so it is excluded exactly as before (test-critic round 2
+    note #1 / #62's fail-open behavior)."""
+    sticky = sticky or {}
     pending: list[tuple[str, str]] = []
     for run_id in _tracked_run_ids(session_id):
         state = _run_state(run_id)
-        if state is not None and state not in _TERMINAL:
+        if state is None:
+            state = sticky.get(run_id)
+            if state is None:
+                continue
+        if state not in _TERMINAL:
             pending.append((run_id, state))
     return pending
 
 
+def _plugin_root() -> Path:
+    """The plugin install root -- `hooks/` (and `bin/`) sit directly under
+    it. Frozen (PyInstaller sets `sys.frozen`): `sys.executable` is
+    `<root>/bin/harness[.exe]`, so `parents[1]` is `<root>`. Source checkout:
+    this file is `<root>/src/harness_plugin/hooks/write_context.py`, so
+    `parents[3]` is `<root>`."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parents[1]
+    return Path(__file__).resolve().parents[3]
+
+
 def _stop_block_message(pending: list[tuple[str, str]]) -> str:
+    """Renders `hooks/stop_wait_message.md`'s single `{run_ids}` placeholder
+    via `str.replace`. If the file cannot be read for any reason (missing,
+    unreadable, unexpected plugin layout), stderr still gets the bare
+    run_ids list -- the hook must never fail open just because its own
+    message file is gone (#64 plan Approach)."""
     names = ", ".join(f"{run_id} ({state})" for run_id, state in pending)
-    return (
-        f"agent-harness: run(s) {names} started in this session are not finished; "
-        "call harness_wait_run / harness_poll_run until they are terminal, or "
-        "harness_stop_run to cancel, before ending the turn."
-    )
+    try:
+        template = (_plugin_root() / "hooks" / _STOP_WAIT_MESSAGE_FILENAME).read_text(encoding="utf-8")
+    except Exception:
+        return names
+    return template.replace("{run_ids}", names)
 
 
 def _cleanup_deny_reason(data: dict) -> str | None:
@@ -241,9 +296,17 @@ def main() -> int:
         pass
 
     if event == "Stop":
-        pending = _pending_runs(data.get("session_id"))
-        if pending:
-            print(_stop_block_message(pending), file=sys.stderr)
-            return 2
+        session_id = data.get("session_id")
+        deadline = time.monotonic() + stop_wait_timeout()
+        pending: list[tuple[str, str]] = []
+        while True:
+            pending = _pending_runs(session_id, sticky=dict(pending))
+            if not pending:
+                return 0
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print(_stop_block_message(pending), file=sys.stderr)
+                return 2
+            time.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
 
     return 0

@@ -2,13 +2,19 @@
 
 Run as a real subprocess (`python -m harness_plugin hook`), the way the plugin's
 hooks.json runs the frozen binary."""
+import contextlib
 import json
 import os
 import subprocess
 import sys
+import time
+import uuid
+from pathlib import Path
 
 import pytest
 from lib_python_harness import FileRunStore, RunState
+
+REPO = Path(__file__).resolve().parents[1]
 
 PRE_TOOL_USE = {
     "session_id": "sess-abc",
@@ -22,7 +28,7 @@ PRE_TOOL_USE = {
 }
 
 
-def run_hook(stdin_text, plugin_data, project_dir="/work/project", extra_env=None):
+def _hook_env(plugin_data, project_dir="/work/project", extra_env=None):
     env = {
         k: v
         for k, v in os.environ.items()
@@ -32,20 +38,80 @@ def run_hook(stdin_text, plugin_data, project_dir="/work/project", extra_env=Non
             "CLAUDE_PROJECT_DIR",
             "CLAUDE_CODE_SESSION_ID",
             "HARNESS_ARTIFACTS_DIR",
+            "HARNESS_STOP_WAIT_TIMEOUT_SECONDS",
         )
     }
     env["CLAUDE_PLUGIN_DATA"] = str(plugin_data)
     env["CLAUDE_PROJECT_DIR"] = project_dir
+    # #64: a real internal wait defaults to 7200s -- keep every test above
+    # (and any test below that does not care about the wait itself) a single
+    # snapshot, matching #62's behavior, unless a test opts in via extra_env.
+    env["HARNESS_STOP_WAIT_TIMEOUT_SECONDS"] = "0"
     if extra_env:
         env.update(extra_env)
+    return env
+
+
+def run_hook(stdin_text, plugin_data, project_dir="/work/project", extra_env=None):
     return subprocess.run(
         [sys.executable, "-m", "harness_plugin", "hook"],
         input=stdin_text,
         capture_output=True,
         text=True,
-        env=env,
+        env=_hook_env(plugin_data, project_dir, extra_env),
         timeout=60,
     )
+
+
+def _spawn_hook(stdin_text, plugin_data, project_dir="/work/project", extra_env=None):
+    """Like `run_hook`, but returns a live `Popen` so a test can interact
+    with the subprocess while it is still running -- the #64 poll loop lives
+    inside a single Stop invocation, not across several hook calls."""
+    return subprocess.Popen(
+        [sys.executable, "-m", "harness_plugin", "hook"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_hook_env(plugin_data, project_dir, extra_env),
+    )
+
+
+@contextlib.contextmanager
+def _running_hook(stdin_text, plugin_data, extra_env=None):
+    """`_spawn_hook`, writing and closing stdin immediately (the real hook
+    reads all of stdin before doing anything), with guaranteed cleanup even
+    when an assertion fails while the subprocess is still alive."""
+    proc = _spawn_hook(stdin_text, plugin_data, extra_env=extra_env)
+    proc.stdin.write(stdin_text)
+    proc.stdin.close()
+    # CPython's POSIX `Popen._communicate` unconditionally calls
+    # `self.stdin.flush()` on its first invocation whenever `self.stdin` is
+    # still a truthy attribute -- even though we already closed it above --
+    # and only suppresses `BrokenPipeError`, not the `ValueError: I/O
+    # operation on closed file.` that flushing an already-closed stream
+    # raises. That made every test below's own `proc.communicate(...)` call
+    # blow up on Linux (never on Windows, whose `_communicate` instead
+    # spawns reader/writer threads and only closes -- never flushes -- an
+    # already-closed stdin, which is a harmless no-op). Clearing the
+    # attribute once we're done with it tells `communicate()` there is no
+    # stdin pipe left to manage, matching the state a caller who never
+    # touched stdin directly would be in.
+    proc.stdin = None
+    try:
+        yield proc
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        with contextlib.suppress(Exception):
+            proc.communicate(timeout=5)
+
+
+def _wait_for_file(path, timeout=15):
+    deadline = time.monotonic() + timeout
+    while not path.is_file():
+        assert time.monotonic() < deadline, f"{path} never appeared within {timeout}s"
+        time.sleep(0.05)
 
 
 def test_hook_writes_session_context(tmp_path):
@@ -616,3 +682,340 @@ def test_cleanup_not_denied_for_other_sessions_run(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
     assert "deny" not in proc.stdout, proc.stdout
+
+
+# --- #64: Stop hook waits internally for non-terminal runs ------------------------
+#
+# `_hook_env` puts HARNESS_STOP_WAIT_TIMEOUT_SECONDS="0" in every test above (and
+# in any test below that does not care about the wait itself), so #62's tests keep
+# taking a single snapshot; these tests opt into a real wait via extra_env.
+#
+# `_running_hook`/`_wait_for_file` let a test interact with a still-running Stop
+# subprocess: `write_context.main()`'s generic per-event session-context write
+# (before the Stop branch) happens exactly once, at the very start of *this*
+# process's `main()` call -- so deleting sessions/<sid>.json right after `_track()`
+# and waiting for it to reappear is the signal that *this* Stop invocation has
+# reached its own check, not an artifact of `_track()`'s own PostToolUse call.
+
+
+@pytest.mark.parametrize(
+    "terminal_state",
+    [RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED],
+    ids=["COMPLETED", "FAILED", "CANCELLED"],
+)
+def test_stop_waits_until_run_terminal(tmp_path, terminal_state):
+    """R1 driving test: a real Stop subprocess with a RUNNING tracked run
+    exits 0 once the real record turns terminal, with no tool call in
+    between -- the poll loop must run inside this one invocation, and must
+    notice the flip within a few poll intervals rather than sleeping to the
+    20s deadline (tautology::F1: a snapshot-then-sleep-then-recheck hook
+    that never re-reads would also exit 0 eventually here, just ~19s late).
+
+    Expected RED reason: the current code exits 2 on its first snapshot
+    (there is no loop), so `assert proc.returncode == 0` fails with 2 == 0."""
+    plugin_data = tmp_path / "plugin-data"
+    artifacts_dir = tmp_path / "artifacts"
+    extra_env = {"HARNESS_ARTIFACTS_DIR": str(artifacts_dir), "HARNESS_STOP_WAIT_TIMEOUT_SECONDS": "20"}
+    session_id = "sess-wait"
+    run_id = "run-wait"
+
+    _seed_record(artifacts_dir, run_id, RunState.RUNNING)
+    _track(plugin_data, extra_env, session_id, "mcp__harness__harness_start_agent", run_id)
+
+    session_file = plugin_data / "sessions" / f"{session_id}.json"
+    assert session_file.is_file()
+    session_file.unlink()
+
+    with _running_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=extra_env) as proc:
+        _wait_for_file(session_file)
+        time.sleep(1)
+        flip_time = time.monotonic()
+        _seed_record(artifacts_dir, run_id, terminal_state)
+
+        out, err = proc.communicate(timeout=40)
+        elapsed_since_flip = time.monotonic() - flip_time
+        assert proc.returncode == 0, f"stdout={out!r} stderr={err!r}"
+        assert err == "", err
+        # tautology::F1: bound how soon the exit follows the flip so only a
+        # loop that keeps re-reading record.json (not one that snapshots
+        # once, sleeps to the 20s deadline, then snapshots again) can pass.
+        assert elapsed_since_flip < 5, (
+            f"hook took {elapsed_since_flip:.2f}s to exit after the run turned "
+            f"terminal (timeout was 20s) -- expected it to notice within a few "
+            f"poll intervals, not sleep to the deadline; stdout={out!r} stderr={err!r}"
+        )
+
+
+def test_stop_waits_for_all_tracked_runs_before_terminal(tmp_path):
+    """R1 additional coverage: with two tracked runs, Stop keeps waiting
+    while either one is non-terminal, and only exits 0 once both are.
+
+    Expected RED reason: same as the driving test -- the current code
+    exits 2 on the very first snapshot, so `proc.poll()` is already `2`
+    (not `None`) by the time this test checks it."""
+    plugin_data = tmp_path / "plugin-data"
+    artifacts_dir = tmp_path / "artifacts"
+    extra_env = {"HARNESS_ARTIFACTS_DIR": str(artifacts_dir), "HARNESS_STOP_WAIT_TIMEOUT_SECONDS": "20"}
+    session_id = "sess-wait-two"
+    run_a, run_b = "run-wait-a", "run-wait-b"
+
+    _seed_record(artifacts_dir, run_a, RunState.RUNNING)
+    _seed_record(artifacts_dir, run_b, RunState.RUNNING)
+    _track(plugin_data, extra_env, session_id, "mcp__harness__harness_start_agent", run_a)
+    _track(plugin_data, extra_env, session_id, "mcp__harness__harness_start_agent", run_b)
+
+    session_file = plugin_data / "sessions" / f"{session_id}.json"
+    session_file.unlink()
+
+    with _running_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=extra_env) as proc:
+        _wait_for_file(session_file)
+        time.sleep(1)
+
+        _seed_record(artifacts_dir, run_a, RunState.COMPLETED)
+        time.sleep(1)
+        assert proc.poll() is None, "must still wait while run_b is RUNNING"
+
+        _seed_record(artifacts_dir, run_b, RunState.COMPLETED)
+        out, err = proc.communicate(timeout=40)
+        assert proc.returncode == 0, f"stdout={out!r} stderr={err!r}"
+
+
+def test_stop_wait_survives_unreadable_record(tmp_path):
+    """R2 driving test: a run already seen as RUNNING stays pending while
+    its record.json is transiently unreadable, instead of the glitch being
+    read as "gone" and letting Stop exit 0 early (the sticky-state rule,
+    plan Approach).
+
+    The corrupt window is sized off the real `_POLL_INTERVAL_SECONDS`
+    constant (tautology::F2) rather than a hand-picked literal, so the
+    test stays deterministic regardless of the actual poll interval: a
+    loop without the sticky fallback that happened to poll slower than a
+    hardcoded window would otherwise miss the glitch and pass wrongly.
+
+    Expected RED reason: `_POLL_INTERVAL_SECONDS` does not exist in
+    `harness_plugin.hooks.write_context` yet, so this import raises
+    ImportError. Once the poll loop exists but without the sticky
+    fallback, the current code has already exited 2 on its first
+    (successful) snapshot -- or a non-sticky loop would read the glitch as
+    "gone" and exit 0 during the corrupt window -- either way
+    `proc.poll() is None` is false."""
+    from harness_plugin.hooks.write_context import _POLL_INTERVAL_SECONDS
+
+    plugin_data = tmp_path / "plugin-data"
+    artifacts_dir = tmp_path / "artifacts"
+    extra_env = {"HARNESS_ARTIFACTS_DIR": str(artifacts_dir), "HARNESS_STOP_WAIT_TIMEOUT_SECONDS": "20"}
+    session_id = "sess-glitch"
+    run_id = "run-glitch"
+
+    _seed_record(artifacts_dir, run_id, RunState.RUNNING)
+    _track(plugin_data, extra_env, session_id, "mcp__harness__harness_start_agent", run_id)
+
+    session_file = plugin_data / "sessions" / f"{session_id}.json"
+    session_file.unlink()
+
+    # At least 3 poll intervals of corruption, so a loop without the sticky
+    # fallback is guaranteed a read attempt during the glitch regardless of
+    # the constant's actual value.
+    corrupt_duration = max(_POLL_INTERVAL_SECONDS * 3, 1.0)
+
+    with _running_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=extra_env) as proc:
+        _wait_for_file(session_file)
+        time.sleep(1)
+
+        (artifacts_dir / run_id / "record.json").write_text("{", encoding="utf-8")
+        time.sleep(corrupt_duration)
+        assert proc.poll() is None, (
+            f"a transient unreadable record must not end the wait (corrupted "
+            f"for {corrupt_duration:.2f}s, >= 3 poll intervals of "
+            f"{_POLL_INTERVAL_SECONDS}s each)"
+        )
+
+        _seed_record(artifacts_dir, run_id, RunState.COMPLETED)
+        out, err = proc.communicate(timeout=40)
+        assert proc.returncode == 0, f"stdout={out!r} stderr={err!r}"
+
+
+def test_stop_blocks_after_wait_timeout(tmp_path):
+    """R3 driving test: with the timeout env var set below how long the run
+    stays RUNNING, Stop exits 2 only once that timeout elapses, still
+    naming the pending run_id -- a timeout never cancels the run (plan
+    Approach).
+
+    Expected RED reason: the current code returns immediately (no wait at
+    all), so `elapsed >= 2.0` fails."""
+    plugin_data = tmp_path / "plugin-data"
+    artifacts_dir = tmp_path / "artifacts"
+    timeout_seconds = 2.0
+    extra_env = {
+        "HARNESS_ARTIFACTS_DIR": str(artifacts_dir),
+        "HARNESS_STOP_WAIT_TIMEOUT_SECONDS": str(timeout_seconds),
+    }
+    session_id = "sess-timeout"
+    run_id = "run-timeout"
+
+    _seed_record(artifacts_dir, run_id, RunState.RUNNING)
+    _track(plugin_data, extra_env, session_id, "mcp__harness__harness_start_agent", run_id)
+
+    start = time.monotonic()
+    stop = run_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=extra_env)
+    elapsed = time.monotonic() - start
+
+    assert stop.returncode == 2, f"stdout={stop.stdout!r} stderr={stop.stderr!r}"
+    assert run_id in stop.stderr
+    assert elapsed >= timeout_seconds, f"elapsed={elapsed}"
+    # tautology::F1: also bound how much *longer* than the configured env var
+    # the hook may take, so this pins the implementation to actually reading
+    # HARNESS_STOP_WAIT_TIMEOUT_SECONDS (`timeout_seconds` above) rather than
+    # a hardcoded deadline that happens to also be >= 2.0 (e.g. the old 7200s
+    # default, or a bug that ignored the env var and used a much longer
+    # fixed wait). Margin covers poll-interval slop and process overhead.
+    assert elapsed < timeout_seconds + 5, (
+        f"hook took {elapsed:.2f}s to exit, expected close to the configured "
+        f"{timeout_seconds}s timeout (plus poll/process overhead); "
+        f"stdout={stop.stdout!r} stderr={stop.stderr!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "env_value,expected",
+    [
+        (None, 7200.0),
+        ("1.5", 1.5),
+        ("0", 0.0),
+        ("-3", 0.0),
+        ("abc", 7200.0),
+        ("nan", 7200.0),
+        ("99999", 7200.0),
+    ],
+    ids=["unset", "one-point-five", "zero", "negative", "non-numeric", "nan", "above-default"],
+)
+def test_stop_wait_timeout_parsing(env_value, expected):
+    """R4 driving test (in-process): host_context.stop_wait_timeout parses
+    HARNESS_STOP_WAIT_TIMEOUT_SECONDS per plan Approach -- unset/non-numeric/
+    non-finite gives the 7200s default, negative clamps to 0, and anything
+    above the default clamps down to it.
+
+    Expected RED reason: host_context has no stop_wait_timeout yet, so this
+    import raises ImportError."""
+    from harness_plugin.host_context import STOP_WAIT_TIMEOUT_ENV, stop_wait_timeout
+
+    env = {} if env_value is None else {STOP_WAIT_TIMEOUT_ENV: env_value}
+    assert stop_wait_timeout(env) == expected
+
+
+def test_hooks_json_stop_timeout_exceeds_internal_wait():
+    """R5 driving test: every hooks.json Stop entry's timeout sits
+    comfortably above the longest possible internal wait, so Claude Code's
+    own hook timeout can never cut a real wait short.
+
+    The expected threshold is derived by calling the real
+    `stop_wait_timeout()` clamp itself with a deliberately huge override
+    (tautology::F5), not by hand-copying `STOP_WAIT_TIMEOUT_DEFAULT_SECONDS`
+    plus a literal margin -- a future change to the clamp's own ceiling
+    logic (not just to the default constant) is caught too, since a
+    constant that disagreed with the applied clamp would otherwise let a
+    hooks.json value below the real internal wait pass.
+
+    Expected RED reason: host_context has no stop_wait_timeout /
+    HARNESS_STOP_WAIT_TIMEOUT_SECONDS yet, so this import raises
+    ImportError; once it exists, hooks.json's unchanged 10 fails against
+    the real computed ceiling."""
+    from harness_plugin.host_context import STOP_WAIT_TIMEOUT_ENV, stop_wait_timeout
+
+    # The real clamp's own ceiling: an absurdly large override still clamps
+    # down to whatever stop_wait_timeout() actually treats as its maximum --
+    # the true longest possible internal wait, read from the real code path
+    # rather than trusted to match a separately-copied constant.
+    max_possible_wait = stop_wait_timeout({STOP_WAIT_TIMEOUT_ENV: "999999999999"})
+    assert max_possible_wait > 0, "stop_wait_timeout produced a non-positive ceiling"
+
+    margin_seconds = 60
+    data = json.loads((REPO / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    stop_groups = data["hooks"]["Stop"]
+    assert stop_groups, "no hooks.json Stop group"
+    for group in stop_groups:
+        for entry in group["hooks"]:
+            assert entry["timeout"] >= max_possible_wait + margin_seconds, entry
+
+
+def test_stop_message_rendered_from_file(tmp_path):
+    """R6 driving test: the exit-2 message is actually loaded and rendered
+    from hooks/stop_wait_message.md at runtime, not reproduced from #62's
+    old hardcoded prose. Two distinct, uniquely-marked versions of the file
+    are written in turn; a hook that genuinely reads the file must
+    round-trip each marker verbatim (with {run_ids} filled in) into a
+    blocked Stop's stderr, and switching the file's content must switch
+    stderr's content. A bare "does the file contain {run_ids}" check
+    (tautology::F4) would pass for any file with that token whether or not
+    the hook ever opens it; reproducing this with the file's own real prose
+    (tautology::F3) would also pass for an unmodified hook that never reads
+    the file at all. The two distinct random markers below rule out both:
+    no coincidental wording overlap is possible, and marker A must
+    disappear once the file switches to marker B.
+
+    Expected RED reason: the current hook still calls the hardcoded
+    `_stop_block_message` and never opens hooks/stop_wait_message.md at
+    all, so neither marker ever reaches stderr -- `assert marker_a in
+    stderr_a` fails first."""
+    message_path = REPO / "hooks" / "stop_wait_message.md"
+    original = message_path.read_text(encoding="utf-8") if message_path.is_file() else None
+
+    def _stderr_for_template(template_text):
+        message_path.write_text(template_text, encoding="utf-8")
+        plugin_data = tmp_path / f"plugin-data-{uuid.uuid4().hex}"
+        artifacts_dir = tmp_path / f"artifacts-{uuid.uuid4().hex}"
+        extra_env = {"HARNESS_ARTIFACTS_DIR": str(artifacts_dir)}
+        session_id = "sess-message"
+        run_id = "run-message"
+        _seed_record(artifacts_dir, run_id, RunState.RUNNING)
+        _track(plugin_data, extra_env, session_id, "mcp__harness__harness_start_agent", run_id)
+
+        stop = run_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=extra_env)
+        assert stop.returncode == 2, f"stdout={stop.stdout!r} stderr={stop.stderr!r}"
+        assert run_id in stop.stderr
+        # tautology::F2: `run_id in stop.stderr` alone would also pass a hook
+        # that appended run_id somewhere unrelated to the {run_ids}
+        # placeholder (e.g. always tacked on at the end, ignoring the
+        # template's own layout). Locate the placeholder's fixed prefix in
+        # the rendered output and require run_id to start exactly there --
+        # i.e. genuinely substituted at the placeholder's position, not just
+        # present somewhere in stderr.
+        prefix, _, _ = template_text.partition("{run_ids}")
+        prefix_at = stop.stderr.find(prefix)
+        assert prefix_at != -1, (
+            f"template's own fixed prefix before {{run_ids}} not found verbatim "
+            f"in stderr; stderr={stop.stderr!r}"
+        )
+        after_prefix = stop.stderr[prefix_at + len(prefix):]
+        assert after_prefix.startswith(run_id), (
+            f"run_id must be substituted exactly at the {{run_ids}} placeholder's "
+            f"position, not merely present elsewhere in stderr; "
+            f"after_prefix={after_prefix!r}"
+        )
+        return stop.stderr
+
+    try:
+        marker_a = f"MARKER-A-{uuid.uuid4().hex}"
+        template_a = f"{marker_a} pending run(s): {{run_ids}} -- {marker_a}-tail"
+        stderr_a = _stderr_for_template(template_a)
+        assert marker_a in stderr_a, (
+            f"hook did not render hooks/stop_wait_message.md's own content "
+            f"(marker A missing); stderr={stderr_a!r}"
+        )
+
+        marker_b = f"MARKER-B-{uuid.uuid4().hex}"
+        template_b = f"{marker_b} a completely different wording: {{run_ids}} :: {marker_b}-end"
+        stderr_b = _stderr_for_template(template_b)
+        assert marker_b in stderr_b, (
+            f"hook did not render the file's new content after it changed "
+            f"(marker B missing); stderr={stderr_b!r}"
+        )
+        assert marker_a not in stderr_b, (
+            "stderr still carries marker A after the file's content changed -- "
+            f"the hook is not re-reading the file at runtime; stderr={stderr_b!r}"
+        )
+    finally:
+        if original is None:
+            message_path.unlink(missing_ok=True)
+        else:
+            message_path.write_text(original, encoding="utf-8")

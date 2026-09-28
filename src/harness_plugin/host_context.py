@@ -5,6 +5,7 @@ Deliberately free of `mcp`/`lib_python_harness` imports at module level so the p
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from collections.abc import Mapping
@@ -14,6 +15,35 @@ from typing import Any
 SESSION_ENV = "CLAUDE_CODE_SESSION_ID"
 PROJECT_ENV = "CLAUDE_PROJECT_DIR"
 PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA"
+
+# #64: how long the Stop hook's internal poll loop waits for every run tracked
+# in a session to reach a terminal state before giving up and exiting 2 (see
+# hooks/write_context.py's Stop branch). Defined once here, importable, so
+# hooks.json's own Stop timeout (which must stay above this) and the hook
+# itself never drift apart.
+STOP_WAIT_TIMEOUT_ENV = "HARNESS_STOP_WAIT_TIMEOUT_SECONDS"
+STOP_WAIT_TIMEOUT_DEFAULT_SECONDS = 7200.0
+
+
+def stop_wait_timeout(env: Mapping[str, str] | None = None) -> float:
+    """Parse `HARNESS_STOP_WAIT_TIMEOUT_SECONDS`: unset, non-numeric or
+    non-finite (`nan`/`inf`) gives the default; negative clamps to 0 (which
+    means a single snapshot, matching #62); anything above the default
+    clamps down to it, so hooks.json's own Stop timeout can always be set
+    once, safely above this ceiling."""
+    env = os.environ if env is None else env
+    raw = env.get(STOP_WAIT_TIMEOUT_ENV)
+    if raw is None:
+        return STOP_WAIT_TIMEOUT_DEFAULT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return STOP_WAIT_TIMEOUT_DEFAULT_SECONDS
+    if not math.isfinite(value):
+        return STOP_WAIT_TIMEOUT_DEFAULT_SECONDS
+    if value < 0:
+        return 0.0
+    return min(value, STOP_WAIT_TIMEOUT_DEFAULT_SECONDS)
 
 
 def sessions_dir(env: Mapping[str, str] | None = None) -> Path:

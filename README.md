@@ -74,7 +74,7 @@ It prints one `harness_poll_run`-shaped JSON object plus `waited_s` on stdout an
 
 ## A session cannot end while it started a run that is still going
 
-A `PostToolUse` hook tracks every run a session starts with `harness_start_agent`, `harness_start_prompt` or `harness_send_message` (the `run_id` each returns). At `Stop`, unconditionally and with no opt-out, the hook blocks turn-end (exit 2) unless every run tracked for that session has reached a terminal state (COMPLETED, FAILED or CANCELLED) — the stderr message names the pending `run_id`(s). This closes the failure mode where an agent starts an async run and then ends its own turn without ever waiting on or stopping it, orphaning the run: nobody polls or stops it, and its result is never collected.
+A `PostToolUse` hook tracks every run a session starts with `harness_start_agent`, `harness_start_prompt` or `harness_send_message` (the `run_id` each returns). At `Stop`, unconditionally and with no opt-out, the hook itself waits — re-reading every tracked run's record roughly every 0.5s — until every run tracked for that session has reached a terminal state (COMPLETED, FAILED or CANCELLED), so the calling agent spends no turn and no context window polling. If the wait outlasts `HARNESS_STOP_WAIT_TIMEOUT_SECONDS` (default and ceiling 7200s; set it to `0` to fall back to a single snapshot, matching the plugin's pre-#64 behavior), the hook gives up and blocks turn-end (exit 2) — the stderr message, rendered from `hooks/stop_wait_message.md`, names the still-pending `run_id`(s). A timeout never cancels the run: it is left exactly as it was, still RUNNING.
 
 There are exactly two ways out of the block:
 
