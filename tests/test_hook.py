@@ -2,13 +2,18 @@
 
 Run as a real subprocess (`python -m harness_plugin hook`), the way the plugin's
 hooks.json runs the frozen binary."""
+import contextlib
 import json
 import os
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 import pytest
 from lib_python_harness import FileRunStore, RunState
+
+REPO = Path(__file__).resolve().parents[1]
 
 PRE_TOOL_USE = {
     "session_id": "sess-abc",
@@ -22,7 +27,7 @@ PRE_TOOL_USE = {
 }
 
 
-def run_hook(stdin_text, plugin_data, project_dir="/work/project", extra_env=None):
+def _hook_env(plugin_data, project_dir="/work/project", extra_env=None):
     env = {
         k: v
         for k, v in os.environ.items()
@@ -32,20 +37,67 @@ def run_hook(stdin_text, plugin_data, project_dir="/work/project", extra_env=Non
             "CLAUDE_PROJECT_DIR",
             "CLAUDE_CODE_SESSION_ID",
             "HARNESS_ARTIFACTS_DIR",
+            "HARNESS_STOP_WAIT_TIMEOUT_SECONDS",
         )
     }
     env["CLAUDE_PLUGIN_DATA"] = str(plugin_data)
     env["CLAUDE_PROJECT_DIR"] = project_dir
+    # #64: a real internal wait defaults to 7200s -- keep every test above
+    # (and any test below that does not care about the wait itself) a single
+    # snapshot, matching #62's behavior, unless a test opts in via extra_env.
+    env["HARNESS_STOP_WAIT_TIMEOUT_SECONDS"] = "0"
     if extra_env:
         env.update(extra_env)
+    return env
+
+
+def run_hook(stdin_text, plugin_data, project_dir="/work/project", extra_env=None):
     return subprocess.run(
         [sys.executable, "-m", "harness_plugin", "hook"],
         input=stdin_text,
         capture_output=True,
         text=True,
-        env=env,
+        env=_hook_env(plugin_data, project_dir, extra_env),
         timeout=60,
     )
+
+
+def _spawn_hook(stdin_text, plugin_data, project_dir="/work/project", extra_env=None):
+    """Like `run_hook`, but returns a live `Popen` so a test can interact
+    with the subprocess while it is still running -- the #64 poll loop lives
+    inside a single Stop invocation, not across several hook calls."""
+    return subprocess.Popen(
+        [sys.executable, "-m", "harness_plugin", "hook"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_hook_env(plugin_data, project_dir, extra_env),
+    )
+
+
+@contextlib.contextmanager
+def _running_hook(stdin_text, plugin_data, extra_env=None):
+    """`_spawn_hook`, writing and closing stdin immediately (the real hook
+    reads all of stdin before doing anything), with guaranteed cleanup even
+    when an assertion fails while the subprocess is still alive."""
+    proc = _spawn_hook(stdin_text, plugin_data, extra_env=extra_env)
+    proc.stdin.write(stdin_text)
+    proc.stdin.close()
+    try:
+        yield proc
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        with contextlib.suppress(Exception):
+            proc.communicate(timeout=5)
+
+
+def _wait_for_file(path, timeout=15):
+    deadline = time.monotonic() + timeout
+    while not path.is_file():
+        assert time.monotonic() < deadline, f"{path} never appeared within {timeout}s"
+        time.sleep(0.05)
 
 
 def test_hook_writes_session_context(tmp_path):
@@ -616,3 +668,219 @@ def test_cleanup_not_denied_for_other_sessions_run(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
     assert "deny" not in proc.stdout, proc.stdout
+
+
+# --- #64: Stop hook waits internally for non-terminal runs ------------------------
+#
+# `_hook_env` puts HARNESS_STOP_WAIT_TIMEOUT_SECONDS="0" in every test above (and
+# in any test below that does not care about the wait itself), so #62's tests keep
+# taking a single snapshot; these tests opt into a real wait via extra_env.
+#
+# `_running_hook`/`_wait_for_file` let a test interact with a still-running Stop
+# subprocess: `write_context.main()`'s generic per-event session-context write
+# (before the Stop branch) happens exactly once, at the very start of *this*
+# process's `main()` call -- so deleting sessions/<sid>.json right after `_track()`
+# and waiting for it to reappear is the signal that *this* Stop invocation has
+# reached its own check, not an artifact of `_track()`'s own PostToolUse call.
+
+
+@pytest.mark.parametrize(
+    "terminal_state",
+    [RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED],
+    ids=["COMPLETED", "FAILED", "CANCELLED"],
+)
+def test_stop_waits_until_run_terminal(tmp_path, terminal_state):
+    """R1 driving test: a real Stop subprocess with a RUNNING tracked run
+    exits 0 once the real record turns terminal, with no tool call in
+    between -- the poll loop must run inside this one invocation.
+
+    Expected RED reason: the current code exits 2 on its first snapshot
+    (there is no loop), so `assert proc.returncode == 0` fails with 2 == 0."""
+    plugin_data = tmp_path / "plugin-data"
+    artifacts_dir = tmp_path / "artifacts"
+    extra_env = {"HARNESS_ARTIFACTS_DIR": str(artifacts_dir), "HARNESS_STOP_WAIT_TIMEOUT_SECONDS": "20"}
+    session_id = "sess-wait"
+    run_id = "run-wait"
+
+    _seed_record(artifacts_dir, run_id, RunState.RUNNING)
+    _track(plugin_data, extra_env, session_id, "mcp__harness__harness_start_agent", run_id)
+
+    session_file = plugin_data / "sessions" / f"{session_id}.json"
+    assert session_file.is_file()
+    session_file.unlink()
+
+    with _running_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=extra_env) as proc:
+        _wait_for_file(session_file)
+        time.sleep(1)
+        _seed_record(artifacts_dir, run_id, terminal_state)
+
+        out, err = proc.communicate(timeout=40)
+        assert proc.returncode == 0, f"stdout={out!r} stderr={err!r}"
+        assert err == "", err
+
+
+def test_stop_waits_for_all_tracked_runs_before_terminal(tmp_path):
+    """R1 additional coverage: with two tracked runs, Stop keeps waiting
+    while either one is non-terminal, and only exits 0 once both are.
+
+    Expected RED reason: same as the driving test -- the current code
+    exits 2 on the very first snapshot, so `proc.poll()` is already `2`
+    (not `None`) by the time this test checks it."""
+    plugin_data = tmp_path / "plugin-data"
+    artifacts_dir = tmp_path / "artifacts"
+    extra_env = {"HARNESS_ARTIFACTS_DIR": str(artifacts_dir), "HARNESS_STOP_WAIT_TIMEOUT_SECONDS": "20"}
+    session_id = "sess-wait-two"
+    run_a, run_b = "run-wait-a", "run-wait-b"
+
+    _seed_record(artifacts_dir, run_a, RunState.RUNNING)
+    _seed_record(artifacts_dir, run_b, RunState.RUNNING)
+    _track(plugin_data, extra_env, session_id, "mcp__harness__harness_start_agent", run_a)
+    _track(plugin_data, extra_env, session_id, "mcp__harness__harness_start_agent", run_b)
+
+    session_file = plugin_data / "sessions" / f"{session_id}.json"
+    session_file.unlink()
+
+    with _running_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=extra_env) as proc:
+        _wait_for_file(session_file)
+        time.sleep(1)
+
+        _seed_record(artifacts_dir, run_a, RunState.COMPLETED)
+        time.sleep(1)
+        assert proc.poll() is None, "must still wait while run_b is RUNNING"
+
+        _seed_record(artifacts_dir, run_b, RunState.COMPLETED)
+        out, err = proc.communicate(timeout=40)
+        assert proc.returncode == 0, f"stdout={out!r} stderr={err!r}"
+
+
+def test_stop_wait_survives_unreadable_record(tmp_path):
+    """R2 driving test: a run already seen as RUNNING stays pending while
+    its record.json is transiently unreadable, instead of the glitch being
+    read as "gone" and letting Stop exit 0 early (the sticky-state rule,
+    plan Approach).
+
+    Expected RED reason: the current code has already exited 2 on its
+    first (successful) snapshot, so `proc.poll() is None` is false. A loop
+    without the sticky fallback would instead have exited 0 by this point,
+    which this same assertion also catches."""
+    plugin_data = tmp_path / "plugin-data"
+    artifacts_dir = tmp_path / "artifacts"
+    extra_env = {"HARNESS_ARTIFACTS_DIR": str(artifacts_dir), "HARNESS_STOP_WAIT_TIMEOUT_SECONDS": "20"}
+    session_id = "sess-glitch"
+    run_id = "run-glitch"
+
+    _seed_record(artifacts_dir, run_id, RunState.RUNNING)
+    _track(plugin_data, extra_env, session_id, "mcp__harness__harness_start_agent", run_id)
+
+    session_file = plugin_data / "sessions" / f"{session_id}.json"
+    session_file.unlink()
+
+    with _running_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=extra_env) as proc:
+        _wait_for_file(session_file)
+        time.sleep(1)
+
+        (artifacts_dir / run_id / "record.json").write_text("{", encoding="utf-8")
+        time.sleep(1.5)
+        assert proc.poll() is None, "a transient unreadable record must not end the wait"
+
+        _seed_record(artifacts_dir, run_id, RunState.COMPLETED)
+        out, err = proc.communicate(timeout=40)
+        assert proc.returncode == 0, f"stdout={out!r} stderr={err!r}"
+
+
+def test_stop_blocks_after_wait_timeout(tmp_path):
+    """R3 driving test: with the timeout env var set below how long the run
+    stays RUNNING, Stop exits 2 only once that timeout elapses, still
+    naming the pending run_id -- a timeout never cancels the run (plan
+    Approach).
+
+    Expected RED reason: the current code returns immediately (no wait at
+    all), so `elapsed >= 2.0` fails."""
+    plugin_data = tmp_path / "plugin-data"
+    artifacts_dir = tmp_path / "artifacts"
+    extra_env = {"HARNESS_ARTIFACTS_DIR": str(artifacts_dir), "HARNESS_STOP_WAIT_TIMEOUT_SECONDS": "2"}
+    session_id = "sess-timeout"
+    run_id = "run-timeout"
+
+    _seed_record(artifacts_dir, run_id, RunState.RUNNING)
+    _track(plugin_data, extra_env, session_id, "mcp__harness__harness_start_agent", run_id)
+
+    start = time.monotonic()
+    stop = run_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=extra_env)
+    elapsed = time.monotonic() - start
+
+    assert stop.returncode == 2, f"stdout={stop.stdout!r} stderr={stop.stderr!r}"
+    assert run_id in stop.stderr
+    assert elapsed >= 2.0, f"elapsed={elapsed}"
+
+
+@pytest.mark.parametrize(
+    "env_value,expected",
+    [
+        (None, 7200.0),
+        ("1.5", 1.5),
+        ("0", 0.0),
+        ("-3", 0.0),
+        ("abc", 7200.0),
+        ("nan", 7200.0),
+        ("99999", 7200.0),
+    ],
+    ids=["unset", "one-point-five", "zero", "negative", "non-numeric", "nan", "above-default"],
+)
+def test_stop_wait_timeout_parsing(env_value, expected):
+    """R4 driving test (in-process): host_context.stop_wait_timeout parses
+    HARNESS_STOP_WAIT_TIMEOUT_SECONDS per plan Approach -- unset/non-numeric/
+    non-finite gives the 7200s default, negative clamps to 0, and anything
+    above the default clamps down to it.
+
+    Expected RED reason: host_context has no stop_wait_timeout yet, so this
+    import raises ImportError."""
+    from harness_plugin.host_context import STOP_WAIT_TIMEOUT_ENV, stop_wait_timeout
+
+    env = {} if env_value is None else {STOP_WAIT_TIMEOUT_ENV: env_value}
+    assert stop_wait_timeout(env) == expected
+
+
+def test_hooks_json_stop_timeout_exceeds_internal_wait():
+    """R5 driving test: every hooks.json Stop entry's timeout sits
+    comfortably above the longest possible internal wait, so Claude Code's
+    own hook timeout can never cut a real wait short.
+
+    Expected RED reason: host_context has no STOP_WAIT_TIMEOUT_DEFAULT_SECONDS
+    yet, so this import raises ImportError; once it exists, hooks.json's
+    unchanged 10 fails `10 >= 7260`."""
+    from harness_plugin.host_context import STOP_WAIT_TIMEOUT_DEFAULT_SECONDS
+
+    data = json.loads((REPO / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    stop_groups = data["hooks"]["Stop"]
+    assert stop_groups, "no hooks.json Stop group"
+    for group in stop_groups:
+        for entry in group["hooks"]:
+            assert entry["timeout"] >= STOP_WAIT_TIMEOUT_DEFAULT_SECONDS + 60, entry
+
+
+def test_stop_message_rendered_from_file(tmp_path):
+    """R6 driving test: the exit-2 message comes from
+    hooks/stop_wait_message.md, not hardcoded prose -- every literal chunk
+    of that file (split at its {run_ids} placeholder) appears verbatim in a
+    blocked Stop's stderr, filled in with the real run_id.
+
+    Expected RED reason: hooks/stop_wait_message.md does not exist yet, so
+    reading it raises FileNotFoundError."""
+    template = (REPO / "hooks" / "stop_wait_message.md").read_text(encoding="utf-8")
+    assert "{run_ids}" in template
+
+    plugin_data = tmp_path / "plugin-data"
+    artifacts_dir = tmp_path / "artifacts"
+    extra_env = {"HARNESS_ARTIFACTS_DIR": str(artifacts_dir)}
+    session_id = "sess-message"
+    run_id = "run-message"
+    _seed_record(artifacts_dir, run_id, RunState.RUNNING)
+    _track(plugin_data, extra_env, session_id, "mcp__harness__harness_start_agent", run_id)
+
+    stop = run_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=extra_env)
+    assert stop.returncode == 2, f"stdout={stop.stdout!r} stderr={stop.stderr!r}"
+    for chunk in template.split("{run_ids}"):
+        if chunk:
+            assert chunk in stop.stderr, f"missing literal chunk {chunk!r}; stderr={stop.stderr!r}"
+    assert run_id in stop.stderr

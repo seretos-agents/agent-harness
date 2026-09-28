@@ -293,6 +293,10 @@ def test_stop_hook_command_blocks(plugin_root, bash_exe, tmp_path):
         "CLAUDE_PLUGIN_ROOT": plugin_root.as_posix(),
         "CLAUDE_PLUGIN_DATA": str(plugin_data),
         "HARNESS_ARTIFACTS_DIR": str(artifacts_dir),
+        # #64: the Stop hook now waits internally up to this many seconds;
+        # "0" keeps this test a single snapshot, matching #62's behavior,
+        # instead of waiting up to the new 7200s default.
+        "HARNESS_STOP_WAIT_TIMEOUT_SECONDS": "0",
     }
 
     post_stdin = json.dumps(
