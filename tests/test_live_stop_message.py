@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -192,6 +193,23 @@ def _tool_use_names(lines: list[str], start: int, end: int) -> list[str]:
     return names
 
 
+def _tool_use_inputs(lines: list[str], start: int, end: int, bare_name: str) -> list[dict]:
+    """`input` payloads of every tool_use block within lines[start:end) whose bare
+    name (suffix after the last "__" for an MCP tool) matches `bare_name` --
+    independent evidence of *what a real tool call actually did* (e.g. which
+    run_id harness_stop_run was invoked with), as opposed to what the model's own
+    free-text summary claims (tautology::F3)."""
+    inputs = []
+    for block in _assistant_content_blocks(lines, start, end):
+        if block.get("type") != "tool_use":
+            continue
+        name = block.get("name") or ""
+        bare = name.rsplit("__", 1)[-1] if "__" in name else name
+        if bare == bare_name:
+            inputs.append(block.get("input") or {})
+    return inputs
+
+
 def _bash_commands(lines: list[str], start: int, end: int) -> list[str]:
     commands = []
     for block in _assistant_content_blocks(lines, start, end):
@@ -200,6 +218,24 @@ def _bash_commands(lines: list[str], start: int, end: int) -> list[str]:
             if isinstance(command, str):
                 commands.append(command)
     return commands
+
+
+# tautology::F4: R1's shell-wait check originally matched only the literal
+# substring "harness wait" -- wording that dodges that exact phrase while still
+# leading the model to shell out to a polling/wait workaround (a `harness poll`/
+# `harness status`-style CLI call, or a `sleep`-then-recheck loop in Bash) passed
+# every R1 assertion. Broaden to the family of workarounds the plan's Approach
+# rules out ("no polling loop", "no further calls" once a run is judged working).
+_POLLING_WORKAROUND_PATTERNS = [
+    re.compile(r"harness\s+wait", re.IGNORECASE),
+    re.compile(r"harness\s+poll", re.IGNORECASE),
+    re.compile(r"harness\s+status", re.IGNORECASE),
+    re.compile(r"\bsleep\b", re.IGNORECASE),
+]
+
+
+def _polling_workaround_commands(commands: list[str]) -> list[str]:
+    return [c for c in commands if any(p.search(c) for p in _POLLING_WORKAROUND_PATTERNS)]
 
 
 def _final_result_event(lines: list[str]) -> dict | None:
@@ -283,8 +319,15 @@ def test_live_blocked_working_run_is_not_self_polled(tmp_path, trial):
         )
         assert not waits, f"segment {idx} self-polled via harness_wait_run: names={names}"
         assert not stops, f"segment {idx} cancelled a still-working run: names={names}"
-        shell_waits = [c for c in _bash_commands(lines, block_at, segment_end) if "harness wait" in c]
-        assert not shell_waits, f"segment {idx} shelled out to `harness wait`: {shell_waits}"
+        # tautology::F4: broadened past the literal "harness wait" substring so a
+        # wording that dodges only that exact phrase -- while still leading the
+        # model to shell out to a `harness poll`/`harness status`-style workaround,
+        # or a `sleep`-then-recheck loop -- does not pass R1's no-self-polling
+        # requirement for free.
+        shell_workarounds = _polling_workaround_commands(_bash_commands(lines, block_at, segment_end))
+        assert not shell_workarounds, (
+            f"segment {idx} shelled out to a polling/wait workaround: {shell_workarounds}"
+        )
 
     assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
     final = _final_result_event(lines)
@@ -356,9 +399,28 @@ def test_live_stalled_run_escalates_and_ends(tmp_path, trial):
         f"harness_stop_run must happen in the last segment (the second consecutive "
         f"silent reading), not earlier: {stop_calls_per_segment}"
     )
-    assert not stop_calls_per_segment[0], (
+    # tautology::F2: segment 0 is *not* the first silent reading. The
+    # harness_start_prompt response already carries event_count/last_event_at
+    # (runs.py's run_to_dict includes them unconditionally, and harness_start_prompt
+    # returns run_to_dict(result) with no override -- server.py), so it is the
+    # model's "earlier reading" baseline from the very start. By the time the first
+    # poll happens (after #64's internal wait), the fake job's one Bash tool_use
+    # event has already landed, so segment 0 reads as *advanced* against that
+    # baseline ("working", plan Approach) -- not silent. The first genuinely silent
+    # reading (unchanged since segment 0, Bash still the last_activity, one wait of
+    # grace) is segment -2; escalation happens on the second consecutive silent
+    # reading, segment -1. Assert there are enough segments for that timeline to
+    # have actually happened, and check grace at the real first-silent index
+    # instead of index 0.
+    assert len(blocks) >= 3, (
+        f"expected at least 3 segments: one 'advanced' reading right after the Bash "
+        f"tool_use event, one silent reading given grace, and the second silent "
+        f"reading that escalates; got {len(blocks)}: {stop_calls_per_segment}"
+    )
+    assert not stop_calls_per_segment[-2], (
         f"harness_stop_run must not happen on the first silent reading (one wait of "
-        f"grace, plan Approach): {stop_calls_per_segment}"
+        f"grace, plan Approach) -- segment {len(blocks) - 2} is the first genuinely "
+        f"silent reading, not segment 0: {stop_calls_per_segment}"
     )
 
     assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
@@ -369,6 +431,25 @@ def test_live_stalled_run_escalates_and_ends(tmp_path, trial):
     started = _started_run_ids(artifacts_dir)
     assert len(started) == 1, f"expected exactly one run started, got {started}"
     run_id = next(iter(started))
+
+    # tautology::F3: `run_id in final_text` alone is self-fulfilling -- the blind
+    # prompt (`_blind_prompt` above) explicitly asks the model to echo the run_id in
+    # its own one-line summary, so this held even for a hook message with no report
+    # instruction at all. Ground the check in independent evidence instead: the
+    # harness_stop_run tool call captured from the real escalation segment must
+    # itself have been invoked with the actually-started run_id -- evidence from
+    # what the model's tool call did, not from what it chose to say afterwards.
+    escalation_start = blocks[-1]
+    stop_inputs = _tool_use_inputs(lines, escalation_start, len(lines), "harness_stop_run")
+    assert stop_inputs, (
+        f"no harness_stop_run tool_use captured in the escalation segment; "
+        f"lines={lines[escalation_start:]!r}"
+    )
+    assert stop_inputs[0].get("run_id") == run_id, (
+        f"harness_stop_run was not called with the actually-started run_id "
+        f"{run_id!r} (independent evidence from the real tool call, not the "
+        f"model's self-reported summary text); stop_inputs={stop_inputs!r}"
+    )
     assert run_id in final_text, f"final reply does not name the run_id {run_id!r}: {final_text!r}"
     assert _record_state(artifacts_dir, run_id) == "CANCELLED", (
         f"run {run_id}'s record never reached CANCELLED: "

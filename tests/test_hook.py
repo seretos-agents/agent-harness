@@ -5,6 +5,7 @@ hooks.json runs the frozen binary."""
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -1069,4 +1070,27 @@ def test_stop_sends_committed_message_file(tmp_path):
     )
     assert stop.stderr.startswith(STOP_MARKER), (
         f"stderr does not start with the fixed STOP_MARKER prefix; stderr={stop.stderr!r}"
+    )
+
+    # tautology::F1 (test-critic round 2): the equality check above only proves the
+    # hook renders *some* content from the committed file -- a file that merely
+    # prepends STOP_MARKER in front of the old self-polling wording ("call
+    # harness_wait_run / harness_poll_run until they are terminal") would satisfy
+    # every assertion above it (equality is against the file's own content, and
+    # startswith only needs the prefix). Pin the rendered content to what the plan
+    # actually commits to instead: the removed self-polling instruction is gone
+    # (plan "Mechanism balance" > Removed), and the new exactly-once / don't-abort
+    # guidance the plan's Approach commits to is present.
+    lower = stop.stderr.lower()
+    assert "until they are terminal" not in lower, (
+        "message must not keep the old 'call harness_wait_run / harness_poll_run "
+        f"until they are terminal' self-polling instruction; stderr={stop.stderr!r}"
+    )
+    assert "exactly once" in lower, (
+        "message must tell the agent to call harness_poll_run exactly once per "
+        f"reactivation (plan Approach); stderr={stop.stderr!r}"
+    )
+    assert re.search(r"(do not|don't|never)\s+abort", lower), (
+        "message must explicitly tell the agent not to abort (plan Approach: "
+        f"'do not abort'); stderr={stop.stderr!r}"
     )
