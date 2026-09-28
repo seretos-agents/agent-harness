@@ -173,10 +173,29 @@ def _blind_prompt(directive: str) -> str:
     # asks only for "a summary", so R2's `run_id in final_text` now has a real
     # source: it can only be satisfied by the model following the hook message's
     # own "end with a report naming the run_id ..." instruction (plan Approach).
+    #
+    # R1 retry (#65 round-2 FAIL): captured stdout from the failing trials showed
+    # the model calling harness_start_prompt and then, in that SAME turn, calling
+    # harness_wait_run itself -- it never ended its turn at all, so the Stop hook
+    # never even got a chance to fire once. That is a gap in this prompt's own
+    # sequencing instruction, not the Stop-hook protocol this test exists to prove
+    # blind to: "then end your turn" left room for a model to read "end your turn"
+    # as "eventually, once you've got something worth reporting" rather than
+    # "immediately, with nothing else in between". Tightened below to remove that
+    # room -- "call harness_start_prompt exactly once, then stop, nothing else, no
+    # other tool call" -- while still saying nothing at all about what to do once
+    # blocked (no mention of polling, waiting, or the hook), so it stays blind to
+    # the actual behaviour under test.
     return (
-        f"Use the harness_start_prompt tool with the prompt {directive!r} to start a "
-        "job, then end your turn. Once you have the job's final result, reply with a "
-        "short one-line summary of it, and stop."
+        f"Call the harness_start_prompt tool exactly once, with the prompt "
+        f"{directive!r}, to start a job. The instant that single tool call "
+        "returns, end your turn immediately: do not call any other tool of any "
+        "kind (not harness_start_prompt again, not any tool to check on the job "
+        "or its status), and do not write any other text first. Just stop, with "
+        "nothing else in this turn. You will be given a further turn later; only "
+        "then decide what, if anything, to do next. Once you eventually learn "
+        "the job has a final result, reply with a short one-line summary of it, "
+        "and stop."
     )
 
 
