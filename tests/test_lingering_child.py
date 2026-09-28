@@ -44,6 +44,7 @@ import json
 import time
 
 import anyio
+import anyio.to_thread
 from lib_python_harness import FileRunStore, RunState
 from lib_python_harness.harness import _FINALIZE_GRACE_S as _GRACE_S
 from lib_python_harness.runtime.process import _pid_status
@@ -160,6 +161,25 @@ def test_stop_hook_completes_lingering_child(server_params, tmp_path):
     within budget -- `HARNESS_STOP_WAIT_TIMEOUT_SECONDS` is set well above
     `BUDGET` so a pass can never come from the wait limit merely expiring.
 
+    The originating `harness_start_prompt` session is kept open for the
+    `_track`/Stop-hook window (both run via `anyio.to_thread.run_sync`,
+    since they are blocking subprocess calls) rather than closed right after
+    `_start_lingering` returns: on Windows, `mcp.client.stdio.stdio_client`
+    wraps the spawned `server_params` MCP server in a Job Object with
+    kill-on-close semantics so a disconnecting client can reliably clean up
+    an unresponsive server -- closing the session kills that whole process
+    tree, including the lingering fake-CLI grandchild this test needs to
+    still be alive (independently of its immediate MCP-server parent, #68's
+    own premise) when the separate Stop-hook subprocess goes looking for it.
+    In production the harness_plugin MCP server is not torn down between
+    tool calls -- it persists for the whole Claude Code session -- so this
+    mirrors that lifetime instead of the artifact of a test that opens and
+    closes one MCP session per tool call (verified directly: a plain
+    `subprocess.Popen(..., creationflags=CREATE_NEW_PROCESS_GROUP)`
+    grandchild does survive its immediate parent's exit on this same
+    machine; only the `mcp` SDK's own Job-Object-wrapped process tree does
+    not).
+
     Expected RED reason: the Stop branch only ever does a passive
     `record.json` read (`_run_state`/`_pending_runs`); nothing drives the
     run's own reconciliation, so it never turns terminal and Stop exits 2
@@ -171,19 +191,22 @@ def test_stop_hook_completes_lingering_child(server_params, tmp_path):
     session_id = "sess-68-stop"
 
     async def scenario(session):
-        return await _start_lingering(session)
-
-    t0 = time.monotonic()
-    run_id = _run(scenario, server_params)
-
-    try:
-        _track(plugin_data, extra_env, session_id, "mcp__harness__harness_start_agent", run_id)
-
+        run_id = await _start_lingering(session)
+        t0 = time.monotonic()
+        await anyio.to_thread.run_sync(
+            _track, plugin_data, extra_env, session_id, "mcp__harness__harness_start_agent", run_id
+        )
         stop_env = dict(extra_env)
         stop_env["HARNESS_STOP_WAIT_TIMEOUT_SECONDS"] = str(BUDGET + 30)
-        stop = run_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=stop_env)
+        stop = await anyio.to_thread.run_sync(
+            run_hook, json.dumps(_stop_payload(session_id)), plugin_data, "/work/project", stop_env
+        )
         report_time = time.monotonic()
+        return run_id, t0, report_time, stop
 
+    run_id, t0, report_time, stop = _run(scenario, server_params)
+
+    try:
         assert stop.returncode == 0, (
             f"expected Stop to finalize the lingering run within {BUDGET}s, not block on "
             f"the {BUDGET + 30}s wait limit; stdout={stop.stdout!r} stderr={stop.stderr!r}"

@@ -306,12 +306,16 @@ def harness_start_prompt(
 
 @mcp.tool()
 @_tool_errors
-def harness_poll_run(run_id: str) -> dict[str, Any]:
-    """Return the current state (and result, once finished) of a run without blocking.
+async def harness_poll_run(run_id: str) -> dict[str, Any]:
+    """Return the current state (and result, once finished) of a run without waiting for
+    the run to progress -- but it may take a few seconds to finalize a run whose process
+    lingers after writing its result (the lib's post-completion grace period; see #68).
     While the run is RUNNING, `event_count` and `last_event_at` show progress: they only
     advance while `state` is RUNNING, so a growing count means the run is working and a
     frozen one means it may be hung; once the run is terminal they reset to 0 and None."""
-    return run_to_dict(harness().poll(run_id))
+    h = harness()
+    result = await anyio.to_thread.run_sync(partial(h.wait, run_id, 0))
+    return run_to_dict(result)
 
 
 @mcp.tool()
