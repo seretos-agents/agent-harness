@@ -483,10 +483,13 @@ def test_live_stalled_run_escalates_and_ends(tmp_path, trial):
       report if the model actually read it off a real poll result and followed the
       message's instruction to report it.
 
-    - The block-count inference (`len(blocks) == 3`) is replaced by explicit
-      position checks: the stop is in the last segment; no marker line follows it;
-      the stop segment's poll and the immediately preceding segment's poll are both
-      RUNNING with equal event_count (the second consecutive silent reading).
+    - The block-count inference (`len(blocks) == 3`) was originally replaced by
+      explicit position checks: the stop is in the last segment; the stop segment's
+      poll and the immediately preceding segment's poll are both RUNNING with equal
+      event_count (the second consecutive silent reading). ("No marker line follows
+      it" was dropped as a separate check: test-critic gen2 round 1, tautology::F1
+      found it always vacuously true once "stop is in the last segment" holds -- see
+      the comment at Check 2's old site, below.)
 
     Plan-critic gen2 round 1 (misread::F1, blocking): that position check alone
     ("two equal-event_count RUNNING polls in a row before the stop") cannot tell
@@ -500,10 +503,18 @@ def test_live_stalled_run_escalates_and_ends(tmp_path, trial):
     reaches segment index 1 before the run goes terminal, while the grace-then-
     escalate rule this plan specifies needs a first silent reading that is *not*
     cancelled (segment 1) before the second one that is (segment 2) -- i.e. the
-    stop must sit at segment index >= 2, not just "the last segment". That is
-    exactly what `stop_idx >= 2` below checks, independently of the equal-
-    event_count check, and it is exactly what would fail against a "cancel on the
-    first silent reading" wording (stop would land at index 1).
+    stop must sit at segment index 2.
+
+    Test-critic gen2 round 1 (tautology::F2, major): the original fix for
+    misread::F1 only enforced `stop_idx >= 2`, a floor. That does not rule out a
+    wording that grants two or more waits of grace and cancels on the third (or
+    later) consecutive silent reading -- such a wording would satisfy every other
+    check here too, since event_count never changes again in this scenario once the
+    silence starts. Check 3 below now asserts `stop_idx == 2` exactly, which --
+    combined with Check 1 pinning the stop to the last segment -- pins the total
+    segment count to exactly 3: back to the same exact timing the original
+    `len(blocks) == 3` inference expressed, but derived from position checks rather
+    than a bare count.
 
     Expected RED reason: hooks/stop_wait_message.md has no stall/grace rule at all
     today (and carries no STOP_MARKER, so block detection itself may match zero
@@ -549,33 +560,47 @@ def test_live_stalled_run_escalates_and_ends(tmp_path, trial):
         f"follow it; stop_calls_per_segment={stop_calls_per_segment}"
     )
 
-    # Check 2: "no marker line comes after it" -- an independent scan of the raw
-    # stream past the escalation segment's own end, not merely a fact implied by
-    # how `blocks` (all marker positions) was built and indexed above. Once
-    # harness_stop_run succeeds the run is CANCELLED (terminal), so the Stop hook
-    # cannot block again -- a further marker here would mean the session kept
-    # getting blocked after the cancel instead of ending.
+    # Check 2 removed (test-critic gen2 round 1, tautology::F1, critical): this used
+    # to scan `lines[stop_end:]` for a further STOP_MARKER, claiming to be an
+    # independent proof that the session did not keep getting blocked after the
+    # cancel. But Check 1 above already establishes stop_idx == len(blocks) - 1 (the
+    # stop segment is the *last* recorded segment), and `_segment_bounds` always
+    # returns `end = len(lines)` for the last segment -- so `lines[stop_end:]` is
+    # always `[]` and `not any(...)` over an empty sequence can never be False. The
+    # assertion could not fail under any implementation; it proved nothing beyond
+    # what Check 1 already establishes (same category as gen1 round 3's F4 finding,
+    # resolved the same way there: drop the redundant assertion rather than dress it
+    # up as independent evidence). "The session actually ended, not merely stopped
+    # emitting Stop-hook blocks" is covered by the real, non-tautological signals
+    # already asserted later in this test: `proc.returncode == 0` and the terminal
+    # `result` event (both below) -- those, not a scan of an always-empty slice, are
+    # the genuine evidence that the process exited rather than being killed by an
+    # external timeout.
     stop_start, stop_end = _segment_bounds(blocks, stop_idx, len(lines))
-    remaining_lines = lines[stop_end:]
-    assert not any(STOP_MARKER in line for line in remaining_lines), (
-        f"a Stop-hook block marker appears after the escalation segment -- the "
-        f"session kept getting blocked instead of ending after harness_stop_run; "
-        f"remaining_lines={remaining_lines!r}"
-    )
 
-    # Check 3 (plan-critic gen2 round 1, misread::F1): the stop must sit at segment
-    # index >= 2 -- i.e. at least one silent reading (segment stop_idx - 1) was
-    # given grace and did *not* stop before the escalating one did. A message that
-    # cancels on the very first silent reading (no grace at all) can only ever put
-    # the stop at segment index 1, failing this check even though every poll in
-    # this SLEEP:900 scenario reads the same event_count from the first block
-    # onward (so the equal-event_count check below cannot by itself tell the two
-    # apart -- see the docstring above).
-    assert stop_idx >= 2, (
-        f"harness_stop_run was called in segment {stop_idx} (0-indexed), too early "
-        f"for a grace-then-escalate pattern -- expected at least 3 segments total: "
-        f"one advancing reading, one silent reading given grace (no stop), and the "
-        f"second consecutive silent reading that escalates; "
+    # Check 3 (plan-critic gen2 round 1, misread::F1; tightened per test-critic gen2
+    # round 1, tautology::F2, major): the stop must sit at *exactly* segment index
+    # 2, not merely at index >= 2. A floor alone cannot rule out a wording that
+    # grants two or more waits of grace and only cancels on the third (or later)
+    # consecutive silent reading -- every poll in this SLEEP:900 scenario reads the
+    # same event_count from the first block onward, so such an over-graceful
+    # wording would still satisfy every other check here (equal event_count,
+    # run_id, exit code, CANCELLED) while violating the plan's exact rule: "no
+    # cancel at the first silent reading; harness_stop_run at the second". Combined
+    # with Check 1 (stop_idx == len(blocks) - 1, i.e. the stop is always the last
+    # segment), pinning stop_idx == 2 also pins len(blocks) == 3: one advancing
+    # reading (segment 0: the Bash tool_use event lands before the first poll), one
+    # silent reading given grace (segment 1: no stop), and the second consecutive
+    # silent reading that escalates (segment 2, the last segment). stop_idx < 2
+    # means no grace was given at all; stop_idx > 2 (equivalently, more than 3
+    # segments) means more than one wait of grace was granted before cancelling.
+    assert stop_idx == 2, (
+        f"harness_stop_run was called in segment {stop_idx} (0-indexed) across "
+        f"{len(blocks)} total segments, not segment 2 -- the plan's rule is exactly "
+        f"one silent reading of grace (segment 1) then escalate on the second "
+        f"consecutive silent reading (segment 2); stop_idx < 2 means no grace was "
+        f"given at all, and stop_idx > 2 means more than one wait of grace was "
+        f"granted before cancelling (test-critic gen2 round 1, tautology::F2); "
         f"stop_calls_per_segment={stop_calls_per_segment}"
     )
 
