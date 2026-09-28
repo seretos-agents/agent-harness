@@ -27,7 +27,22 @@ Never blocks the parent's tool call outside those two intentional guards:
 any other failure exits 0 having written nothing. The deny/block branches
 run outside the fail-open try/except that guards the generic per-event
 session-context write -- they must still fire even when that write itself
-fails."""
+fails.
+
+#68: `_pending_runs` used to only ever read `record.json` passively -- nothing
+in the Stop loop ever drove a run's own reconciliation, so a CLEAN `claude -p`
+child that had already written its terminal `result` event but kept its OS
+process alive (lib_python_harness v0.0.10's post-completion grace-kill, gated
+by `Harness.wait`'s `_FINALIZE_GRACE_S`) stayed RUNNING in `record.json`
+forever, and Stop blocked for the full `stop_wait_timeout()` instead of the
+grace period. `_drive_run(run_id)` now calls `harness().wait(run_id, 0)`
+before every `record.json` read in `_pending_runs`, so the loop itself
+advances the run instead of only observing it. It lazily imports `harness`
+from `harness_plugin.runs` (only Stop pays for that import) and fails open
+(`try/except Exception: pass`) -- the passive `record.json` read right after
+it is the existing, unchanged fallback, so a `_drive_run` failure (e.g. a
+record with no pid, as #62/#64's seeded test records have) degrades to
+exactly the old behaviour rather than blocking Stop."""
 from __future__ import annotations
 
 import json
@@ -181,6 +196,23 @@ def _run_state(run_id: str) -> str | None:
     return None
 
 
+def _drive_run(run_id: str) -> None:
+    """#68: advance `run_id`'s own reconciliation (including
+    lib_python_harness v0.0.10's post-completion grace-kill) before the
+    passive `record.json` read that follows. `harness` is imported lazily
+    from `harness_plugin.runs` so only the Stop event pays for it -- every
+    other hook event never imports the lib at all. Fails open
+    (`try/except Exception: pass`): a record with no pid (e.g. #62/#64's
+    seeded test records) or any other error here must fall through to the
+    unchanged passive read, never block Stop."""
+    try:
+        from harness_plugin.runs import harness
+
+        harness().wait(run_id, 0)
+    except Exception:
+        pass
+
+
 def _pending_runs(
     session_id: object, sticky: Mapping[str, str] | None = None
 ) -> list[tuple[str, str]]:
@@ -196,10 +228,16 @@ def _pending_runs(
     being treated as "gone" -- a single glitch mid-wait must not end the
     block early. A run whose very first read fails still has nothing in
     `sticky` yet, so it is excluded exactly as before (test-critic round 2
-    note #1 / #62's fail-open behavior)."""
+    note #1 / #62's fail-open behavior).
+
+    #68: `_drive_run(run_id)` runs before each `record.json` read below, so
+    this loop actually advances a run's own state (including the grace-kill
+    for a lingering-but-result-written child) instead of only observing
+    whatever an unrelated process last wrote."""
     sticky = sticky or {}
     pending: list[tuple[str, str]] = []
     for run_id in _tracked_run_ids(session_id):
+        _drive_run(run_id)
         state = _run_state(run_id)
         if state is None:
             state = sticky.get(run_id)

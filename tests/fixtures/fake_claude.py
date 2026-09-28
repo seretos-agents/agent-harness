@@ -25,6 +25,12 @@ A prompt containing `ALT_INIT_SHAPE` emits the init event's mcp-server list unde
 as dict-shaped items (`{"name": ...}`) instead of plain strings, so a test can exercise
 `harness_inspect_run`'s `_INIT_NAME_FIELDS` alias lookup and `_names()`'s dict branch,
 neither of which `INIT_ANNOUNCEMENTS`'s plain-string/primary-key shape reaches.
+A prompt containing `LINGER:<seconds>` keeps the process alive *after* it has written its
+terminal `result` event -- the opposite of `SLEEP`, which stalls before any event at all.
+This is #68's reproduction of a CLEAN `claude -p` child that has already told the harness
+it is done but does not actually exit its OS process for a while: a test can start such a
+run and exercise the grace-kill (`lib_python_harness.Harness.wait`'s `_FINALIZE_GRACE_S`)
+that is supposed to reap it.
 """
 import json
 import os
@@ -157,6 +163,15 @@ def main() -> int:
         ),
         flush=True,
     )
+
+    linger = re.search(r"LINGER:(\d+(?:\.\d+)?)", prompt)
+    if linger:
+        # The terminal `result` event above is already on disk (flushed); the
+        # OS process itself just keeps running past it, reproducing #68.
+        deadline = time.monotonic() + float(linger.group(1))
+        while time.monotonic() < deadline:
+            time.sleep(0.1)
+
     return 0
 
 

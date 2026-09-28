@@ -13,7 +13,7 @@ from pathlib import Path
 import anyio
 import pytest
 from conftest import SESSION_ID
-from test_mcp_tools import _call, _poll_until_terminal, _run, _session
+from test_mcp_tools import TERMINAL, _call, _poll_until_terminal, _run, _session
 
 pytestmark = pytest.mark.live
 
@@ -1273,3 +1273,64 @@ def test_live_stop_hook_tracks_started_run():
     )
 
     shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+# --- a real CLEAN run's child process exits after COMPLETED, live (#68 R2) --------
+
+
+@pytest.mark.timeout(300)
+def test_live_clean_prompt_child_exits(live_server_params, tmp_path):
+    """R2 (#68): a real CLEAN `claude -p` run (haiku, "Reply OK") reaches
+    COMPLETED through `harness_poll_run` -- polled every 2s, 120s cap -- and
+    its OS child process is gone afterwards. This is the ticket's own
+    symptom, live: R1 (tests/test_lingering_child.py) is the fast,
+    deterministic proof that the grace-kill mechanism works at all; this test
+    is the AC-required evidence that it actually fires against a real CLI.
+
+    Expected RED reason: fails only on a CLI build that lingers past its own
+    terminal `result` event (the ticket's v2.1.283 does) -- there,
+    `harness_poll_run`'s unfixed `poll()` has no grace-kill, so it keeps
+    reporting RUNNING until this test's own 120s cap runs out. A CLI that
+    exits promptly passes both before and after the fix -- falsifying
+    nothing about the plugin-side fix itself, just reproducing (or not) the
+    live CLI-side symptom this ticket exists to route around.
+
+    Expected GREEN outcome: COMPLETED, pid gone. It does not assert how fast
+    the real CLI actually exits (plan R2)."""
+    if shutil.which("claude") is None:
+        pytest.skip("the real `claude` CLI is not on PATH")
+
+    from lib_python_harness import FileRunStore
+    from lib_python_harness.runtime.process import _pid_status
+
+    artifacts_dir = tmp_path / "artifacts"
+
+    async def scenario(session):
+        is_error, text, started = await _call(
+            session, "harness_start_prompt", prompt="Reply OK", model="haiku"
+        )
+        assert not is_error, text
+        run_id = started["run_id"]
+        deadline = time.monotonic() + 120.0
+        payload = None
+        while True:
+            is_error, text, payload = await _call(session, "harness_poll_run", run_id=run_id)
+            assert not is_error, text
+            if payload["state"] in TERMINAL:
+                break
+            assert time.monotonic() < deadline, f"run never finished: {payload}"
+            await anyio.sleep(2.0)
+        if payload["state"] == "RUNNING":
+            await _call(session, "harness_stop_run", run_id=run_id)
+        return run_id, payload
+
+    run_id, payload = _run(scenario, live_server_params)
+    assert payload["state"] == "COMPLETED", payload
+
+    record = FileRunStore(str(artifacts_dir)).get(run_id)
+    assert record is not None, f"no record.json for {run_id} under {artifacts_dir}"
+    pid = record.get("pid")
+    assert pid is not None, f"record for {run_id} has no pid: {record}"
+    assert _pid_status(pid, record.get("start_time")) is False, (
+        "the run's OS child process is still alive after COMPLETED was reported"
+    )
