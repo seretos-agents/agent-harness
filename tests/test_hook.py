@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -692,7 +693,10 @@ def test_cleanup_not_denied_for_other_sessions_run(tmp_path):
 def test_stop_waits_until_run_terminal(tmp_path, terminal_state):
     """R1 driving test: a real Stop subprocess with a RUNNING tracked run
     exits 0 once the real record turns terminal, with no tool call in
-    between -- the poll loop must run inside this one invocation.
+    between -- the poll loop must run inside this one invocation, and must
+    notice the flip within a few poll intervals rather than sleeping to the
+    20s deadline (tautology::F1: a snapshot-then-sleep-then-recheck hook
+    that never re-reads would also exit 0 eventually here, just ~19s late).
 
     Expected RED reason: the current code exits 2 on its first snapshot
     (there is no loop), so `assert proc.returncode == 0` fails with 2 == 0."""
@@ -712,11 +716,21 @@ def test_stop_waits_until_run_terminal(tmp_path, terminal_state):
     with _running_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=extra_env) as proc:
         _wait_for_file(session_file)
         time.sleep(1)
+        flip_time = time.monotonic()
         _seed_record(artifacts_dir, run_id, terminal_state)
 
         out, err = proc.communicate(timeout=40)
+        elapsed_since_flip = time.monotonic() - flip_time
         assert proc.returncode == 0, f"stdout={out!r} stderr={err!r}"
         assert err == "", err
+        # tautology::F1: bound how soon the exit follows the flip so only a
+        # loop that keeps re-reading record.json (not one that snapshots
+        # once, sleeps to the 20s deadline, then snapshots again) can pass.
+        assert elapsed_since_flip < 5, (
+            f"hook took {elapsed_since_flip:.2f}s to exit after the run turned "
+            f"terminal (timeout was 20s) -- expected it to notice within a few "
+            f"poll intervals, not sleep to the deadline; stdout={out!r} stderr={err!r}"
+        )
 
 
 def test_stop_waits_for_all_tracked_runs_before_terminal(tmp_path):
@@ -759,10 +773,21 @@ def test_stop_wait_survives_unreadable_record(tmp_path):
     read as "gone" and letting Stop exit 0 early (the sticky-state rule,
     plan Approach).
 
-    Expected RED reason: the current code has already exited 2 on its
-    first (successful) snapshot, so `proc.poll() is None` is false. A loop
-    without the sticky fallback would instead have exited 0 by this point,
-    which this same assertion also catches."""
+    The corrupt window is sized off the real `_POLL_INTERVAL_SECONDS`
+    constant (tautology::F2) rather than a hand-picked literal, so the
+    test stays deterministic regardless of the actual poll interval: a
+    loop without the sticky fallback that happened to poll slower than a
+    hardcoded window would otherwise miss the glitch and pass wrongly.
+
+    Expected RED reason: `_POLL_INTERVAL_SECONDS` does not exist in
+    `harness_plugin.hooks.write_context` yet, so this import raises
+    ImportError. Once the poll loop exists but without the sticky
+    fallback, the current code has already exited 2 on its first
+    (successful) snapshot -- or a non-sticky loop would read the glitch as
+    "gone" and exit 0 during the corrupt window -- either way
+    `proc.poll() is None` is false."""
+    from harness_plugin.hooks.write_context import _POLL_INTERVAL_SECONDS
+
     plugin_data = tmp_path / "plugin-data"
     artifacts_dir = tmp_path / "artifacts"
     extra_env = {"HARNESS_ARTIFACTS_DIR": str(artifacts_dir), "HARNESS_STOP_WAIT_TIMEOUT_SECONDS": "20"}
@@ -775,13 +800,22 @@ def test_stop_wait_survives_unreadable_record(tmp_path):
     session_file = plugin_data / "sessions" / f"{session_id}.json"
     session_file.unlink()
 
+    # At least 3 poll intervals of corruption, so a loop without the sticky
+    # fallback is guaranteed a read attempt during the glitch regardless of
+    # the constant's actual value.
+    corrupt_duration = max(_POLL_INTERVAL_SECONDS * 3, 1.0)
+
     with _running_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=extra_env) as proc:
         _wait_for_file(session_file)
         time.sleep(1)
 
         (artifacts_dir / run_id / "record.json").write_text("{", encoding="utf-8")
-        time.sleep(1.5)
-        assert proc.poll() is None, "a transient unreadable record must not end the wait"
+        time.sleep(corrupt_duration)
+        assert proc.poll() is None, (
+            f"a transient unreadable record must not end the wait (corrupted "
+            f"for {corrupt_duration:.2f}s, >= 3 poll intervals of "
+            f"{_POLL_INTERVAL_SECONDS}s each)"
+        )
 
         _seed_record(artifacts_dir, run_id, RunState.COMPLETED)
         out, err = proc.communicate(timeout=40)
@@ -846,41 +880,95 @@ def test_hooks_json_stop_timeout_exceeds_internal_wait():
     comfortably above the longest possible internal wait, so Claude Code's
     own hook timeout can never cut a real wait short.
 
-    Expected RED reason: host_context has no STOP_WAIT_TIMEOUT_DEFAULT_SECONDS
-    yet, so this import raises ImportError; once it exists, hooks.json's
-    unchanged 10 fails `10 >= 7260`."""
-    from harness_plugin.host_context import STOP_WAIT_TIMEOUT_DEFAULT_SECONDS
+    The expected threshold is derived by calling the real
+    `stop_wait_timeout()` clamp itself with a deliberately huge override
+    (tautology::F5), not by hand-copying `STOP_WAIT_TIMEOUT_DEFAULT_SECONDS`
+    plus a literal margin -- a future change to the clamp's own ceiling
+    logic (not just to the default constant) is caught too, since a
+    constant that disagreed with the applied clamp would otherwise let a
+    hooks.json value below the real internal wait pass.
 
+    Expected RED reason: host_context has no stop_wait_timeout /
+    HARNESS_STOP_WAIT_TIMEOUT_SECONDS yet, so this import raises
+    ImportError; once it exists, hooks.json's unchanged 10 fails against
+    the real computed ceiling."""
+    from harness_plugin.host_context import STOP_WAIT_TIMEOUT_ENV, stop_wait_timeout
+
+    # The real clamp's own ceiling: an absurdly large override still clamps
+    # down to whatever stop_wait_timeout() actually treats as its maximum --
+    # the true longest possible internal wait, read from the real code path
+    # rather than trusted to match a separately-copied constant.
+    max_possible_wait = stop_wait_timeout({STOP_WAIT_TIMEOUT_ENV: "999999999999"})
+    assert max_possible_wait > 0, "stop_wait_timeout produced a non-positive ceiling"
+
+    margin_seconds = 60
     data = json.loads((REPO / "hooks" / "hooks.json").read_text(encoding="utf-8"))
     stop_groups = data["hooks"]["Stop"]
     assert stop_groups, "no hooks.json Stop group"
     for group in stop_groups:
         for entry in group["hooks"]:
-            assert entry["timeout"] >= STOP_WAIT_TIMEOUT_DEFAULT_SECONDS + 60, entry
+            assert entry["timeout"] >= max_possible_wait + margin_seconds, entry
 
 
 def test_stop_message_rendered_from_file(tmp_path):
-    """R6 driving test: the exit-2 message comes from
-    hooks/stop_wait_message.md, not hardcoded prose -- every literal chunk
-    of that file (split at its {run_ids} placeholder) appears verbatim in a
-    blocked Stop's stderr, filled in with the real run_id.
+    """R6 driving test: the exit-2 message is actually loaded and rendered
+    from hooks/stop_wait_message.md at runtime, not reproduced from #62's
+    old hardcoded prose. Two distinct, uniquely-marked versions of the file
+    are written in turn; a hook that genuinely reads the file must
+    round-trip each marker verbatim (with {run_ids} filled in) into a
+    blocked Stop's stderr, and switching the file's content must switch
+    stderr's content. A bare "does the file contain {run_ids}" check
+    (tautology::F4) would pass for any file with that token whether or not
+    the hook ever opens it; reproducing this with the file's own real prose
+    (tautology::F3) would also pass for an unmodified hook that never reads
+    the file at all. The two distinct random markers below rule out both:
+    no coincidental wording overlap is possible, and marker A must
+    disappear once the file switches to marker B.
 
-    Expected RED reason: hooks/stop_wait_message.md does not exist yet, so
-    reading it raises FileNotFoundError."""
-    template = (REPO / "hooks" / "stop_wait_message.md").read_text(encoding="utf-8")
-    assert "{run_ids}" in template
+    Expected RED reason: the current hook still calls the hardcoded
+    `_stop_block_message` and never opens hooks/stop_wait_message.md at
+    all, so neither marker ever reaches stderr -- `assert marker_a in
+    stderr_a` fails first."""
+    message_path = REPO / "hooks" / "stop_wait_message.md"
+    original = message_path.read_text(encoding="utf-8") if message_path.is_file() else None
 
-    plugin_data = tmp_path / "plugin-data"
-    artifacts_dir = tmp_path / "artifacts"
-    extra_env = {"HARNESS_ARTIFACTS_DIR": str(artifacts_dir)}
-    session_id = "sess-message"
-    run_id = "run-message"
-    _seed_record(artifacts_dir, run_id, RunState.RUNNING)
-    _track(plugin_data, extra_env, session_id, "mcp__harness__harness_start_agent", run_id)
+    def _stderr_for_template(template_text):
+        message_path.write_text(template_text, encoding="utf-8")
+        plugin_data = tmp_path / f"plugin-data-{uuid.uuid4().hex}"
+        artifacts_dir = tmp_path / f"artifacts-{uuid.uuid4().hex}"
+        extra_env = {"HARNESS_ARTIFACTS_DIR": str(artifacts_dir)}
+        session_id = "sess-message"
+        run_id = "run-message"
+        _seed_record(artifacts_dir, run_id, RunState.RUNNING)
+        _track(plugin_data, extra_env, session_id, "mcp__harness__harness_start_agent", run_id)
 
-    stop = run_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=extra_env)
-    assert stop.returncode == 2, f"stdout={stop.stdout!r} stderr={stop.stderr!r}"
-    for chunk in template.split("{run_ids}"):
-        if chunk:
-            assert chunk in stop.stderr, f"missing literal chunk {chunk!r}; stderr={stop.stderr!r}"
-    assert run_id in stop.stderr
+        stop = run_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=extra_env)
+        assert stop.returncode == 2, f"stdout={stop.stdout!r} stderr={stop.stderr!r}"
+        assert run_id in stop.stderr
+        return stop.stderr
+
+    try:
+        marker_a = f"MARKER-A-{uuid.uuid4().hex}"
+        template_a = f"{marker_a} pending run(s): {{run_ids}} -- {marker_a}-tail"
+        stderr_a = _stderr_for_template(template_a)
+        assert marker_a in stderr_a, (
+            f"hook did not render hooks/stop_wait_message.md's own content "
+            f"(marker A missing); stderr={stderr_a!r}"
+        )
+
+        marker_b = f"MARKER-B-{uuid.uuid4().hex}"
+        template_b = f"{marker_b} a completely different wording: {{run_ids}} :: {marker_b}-end"
+        stderr_b = _stderr_for_template(template_b)
+        assert marker_b in stderr_b, (
+            f"hook did not render the file's new content after it changed "
+            f"(marker B missing); stderr={stderr_b!r}"
+        )
+        assert marker_a not in stderr_b, (
+            "stderr still carries marker A after the file's content changed -- "
+            f"the hook is not re-reading the file at runtime; stderr={stderr_b!r}"
+        )
+    finally:
+        if original is None:
+            message_path.unlink(missing_ok=True)
+        else:
+            message_path.write_text(original, encoding="utf-8")
