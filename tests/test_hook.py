@@ -1019,3 +1019,54 @@ def test_stop_message_rendered_from_file(tmp_path):
             message_path.unlink(missing_ok=True)
         else:
             message_path.write_text(original, encoding="utf-8")
+
+
+# --- #65: fixed STOP_MARKER prefix + exact committed-file rendering --------------
+#
+# STOP_MARKER is imported by tests/test_live_stop_message.py -- the live scenarios'
+# block detection there needs a guaranteed distinctive marker to find a Stop block in
+# real `claude` stream-json stdout; the pre-#65 prefix ("agent-harness: run(s) ") is
+# too generic (could coincidentally appear in ordinary model output) for that.
+
+STOP_MARKER = "agent-harness Stop hook: waited for unfinished run(s)"
+
+
+def test_stop_sends_committed_message_file(tmp_path):
+    """R3 driving test: a real Stop subprocess, blocked on one tracked RUNNING run,
+    renders the *actual committed* hooks/stop_wait_message.md (not a swapped-in
+    template like test_stop_message_rendered_from_file uses) -- stderr is exactly
+    that file's `{run_ids}` placeholder filled in with `run-x (RUNNING)`, and starts
+    with the fixed STOP_MARKER prefix #65 introduces.
+
+    Expected RED reason: the current committed file starts with "agent-harness:
+    run(s) {run_ids} started in this session are not finished; call harness_wait_run
+    / harness_poll_run until they are terminal, or harness_stop_run to cancel,
+    before ending the turn." -- `stop.stderr.startswith(STOP_MARKER)` fails on
+    unfixed code."""
+    message_path = REPO / "hooks" / "stop_wait_message.md"
+    template = message_path.read_text(encoding="utf-8")
+    assert template.count("{run_ids}") == 1, (
+        f"expected exactly one {{run_ids}} placeholder in {message_path}, "
+        f"found {template.count('{run_ids}')}"
+    )
+
+    plugin_data = tmp_path / "plugin-data"
+    artifacts_dir = tmp_path / "artifacts"
+    extra_env = {"HARNESS_ARTIFACTS_DIR": str(artifacts_dir)}
+    session_id = "sess-marker"
+    run_id = "run-x"
+
+    _seed_record(artifacts_dir, run_id, RunState.RUNNING)
+    _track(plugin_data, extra_env, session_id, "mcp__harness__harness_start_agent", run_id)
+
+    stop = run_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=extra_env)
+    assert stop.returncode == 2, f"stdout={stop.stdout!r} stderr={stop.stderr!r}"
+
+    expected = template.replace("{run_ids}", f"{run_id} (RUNNING)").strip()
+    assert stop.stderr.strip() == expected, (
+        f"stderr does not match the committed file rendered with run_ids filled in; "
+        f"stderr={stop.stderr!r} expected={expected!r}"
+    )
+    assert stop.stderr.startswith(STOP_MARKER), (
+        f"stderr does not start with the fixed STOP_MARKER prefix; stderr={stop.stderr!r}"
+    )
