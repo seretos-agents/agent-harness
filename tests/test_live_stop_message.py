@@ -31,12 +31,19 @@ import sys
 from pathlib import Path
 
 import pytest
-from test_hook import STOP_MARKER
-from test_live_claude import REPO, _real_credentials_path, _write_json
+from test_live_claude import REPO, _real_credentials_path, _tool_result_text, _write_json
 
 pytestmark = pytest.mark.live
 
 FAKE_CLAUDE = Path(__file__).parent / "fixtures" / "fake_claude.py"
+
+# Moved here from tests/test_hook.py (plan #65 gen2 "Affected files") -- this module
+# is the marker's only consumer now that R3's offline exact-match pinning test (which
+# used to import it from test_hook.py) is dropped. Stream-json block detection below
+# needs a guaranteed distinctive marker to find a Stop block in real `claude`
+# stream-json stdout; the pre-#65 prefix ("agent-harness: run(s) ") was too generic
+# (could coincidentally appear in ordinary model output) for that.
+STOP_MARKER = "agent-harness Stop hook: waited for unfinished run(s)"
 
 _TRIALS = 3
 
@@ -246,6 +253,58 @@ def _tool_use_inputs(lines: list[str], start: int, end: int, bare_name: str) -> 
     return inputs
 
 
+def _segment_bounds(blocks: list[int], idx: int, total_len: int) -> tuple[int, int]:
+    """The `[start, end)` line range of segment `idx` -- from its own STOP_MARKER
+    line up to (but not including) the next one, or the end of the stream for the
+    last segment."""
+    start = blocks[idx]
+    end = blocks[idx + 1] if idx + 1 < len(blocks) else total_len
+    return start, end
+
+
+def _tool_result_blocks(lines: list[str], start: int, end: int) -> list[dict]:
+    return [b for b in _assistant_content_blocks(lines, start, end) if b.get("type") == "tool_result"]
+
+
+def _poll_result_payload(lines: list[str], start: int, end: int) -> dict | None:
+    """The single harness_poll_run call's own tool_result payload within
+    lines[start:end) -- state / event_count / last_activity, read via regex from
+    the real MCP tool_result's raw text content (never `json.loads`, since the
+    exact shape a host wraps a structured dict's text representation in is not
+    pinned here) rather than inferred from the model's own account of what the
+    poll said -- the same independent-evidence-from-the-real-tool-call pattern
+    `_tool_use_inputs` already uses elsewhere in this module (tautology::F3).
+    Returns None if no harness_poll_run tool_use (or no matching tool_result) is
+    found in this range."""
+    poll_use_id = None
+    for block in _assistant_content_blocks(lines, start, end):
+        if block.get("type") != "tool_use":
+            continue
+        name = block.get("name") or ""
+        bare = name.rsplit("__", 1)[-1] if "__" in name else name
+        if bare == "harness_poll_run":
+            poll_use_id = block.get("id")
+            break
+    if poll_use_id is None:
+        return None
+    for block in _tool_result_blocks(lines, start, end):
+        if block.get("tool_use_id") != poll_use_id:
+            continue
+        text = _tool_result_text(block)
+        state_match = re.search(r'"state"\s*:\s*"([A-Z_]+)"', text)
+        count_match = re.search(r'"event_count"\s*:\s*(-?\d+)', text)
+        activity_match = re.search(r'"last_activity"\s*:\s*("(?:[^"\\]|\\.)*"|null)', text)
+        last_activity = None
+        if activity_match and activity_match.group(1) != "null":
+            last_activity = json.loads(activity_match.group(1))
+        return {
+            "state": state_match.group(1) if state_match else None,
+            "event_count": int(count_match.group(1)) if count_match else None,
+            "last_activity": last_activity,
+        }
+    return None
+
+
 def _bash_commands(lines: list[str], start: int, end: int) -> list[str]:
     commands = []
     for block in _assistant_content_blocks(lines, start, end):
@@ -400,44 +459,61 @@ def test_live_blocked_working_run_is_not_self_polled(tmp_path, trial):
 # --- R2: a silent run gets one wait of grace, then is escalated and cancelled ----
 
 
+_STALLED_DIRECTIVE = "TOOL:Bash SLEEP:900"
+
+
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize("trial", range(_TRIALS))
 def test_live_stalled_run_escalates_and_ends(tmp_path, trial):
     """R2 driving test: a run that goes silent right after one Bash tool_use (a
     call that can legitimately run long) gets one silent reading's grace -- no
     cancel on the first silent block -- and is only cancelled (harness_stop_run) on
-    the second consecutive silent reading; the final reply names the run_id and
-    reports the run as stalled. Never more than one poll per block, never
-    harness_wait_run.
+    the second consecutive silent reading; the final reply names the run_id and the
+    last_activity value the escalation poll actually read. Never more than one poll
+    per block, never harness_wait_run.
 
-    tautology::F2 (test-critic round 4, minor): `run_id in final_text` alone proves
-    little -- the model already holds the run_id from harness_start_prompt and from
-    its own harness_stop_run call, so it can name the run_id in a one-line summary
-    whether or not the hook message ever told it to report anything. The
-    `"stall" in final_text.lower()` assertion near the end of this test is the
-    check that is actually tied to the message's specific escalation-report clause
-    ("cancelled as stalled", plan Approach / EXPECTED_MESSAGE_TEMPLATE) -- nothing
-    else in the scenario would lead the model to describe the run that way.
+    Plan #65 gen2 "R2 assertion fixes" (responding to test-critic round 6, F2/F3):
 
-    tautology::F3 (test-critic round 3): the plan's own timeline is exact, not a
-    range -- segment 0 reads advanced (the Bash tool_use event already landed by
-    the first poll, see the F2 comment below), the first silent reading gets grace,
-    the second silent reading cancels. That is exactly 3 segments, not "3 to 4" --
-    a looser `3 <= blocks <= 4` bound would let a message that gives *two* waits of
-    grace (cancelling on the third silent reading, 4 blocks) pass despite breaking
-    the plan's stated threshold ("tolerated silence = one hook wait, two if
-    last_activity is a long-running call"). Pin to exactly 3.
+    - The report-clause check no longer greps for the word "stall" (a paraphrase of
+      the message's own wording, easily satisfied by coincidence or by a differently
+      worded message). It instead requires the final reply to name the run_id AND
+      the `last_activity` value read off the escalation poll's own tool_result --
+      value that appears in neither `_blind_prompt`'s prompt text nor the static
+      hooks/stop_wait_message.md file (checked below), so it can only end up in the
+      report if the model actually read it off a real poll result and followed the
+      message's instruction to report it.
+
+    - The block-count inference (`len(blocks) == 3`) is replaced by explicit
+      position checks: the stop is in the last segment; no marker line follows it;
+      the stop segment's poll and the immediately preceding segment's poll are both
+      RUNNING with equal event_count (the second consecutive silent reading).
+
+    Plan-critic gen2 round 1 (misread::F1, blocking): that position check alone
+    ("two equal-event_count RUNNING polls in a row before the stop") cannot tell
+    the promised grace wait apart from cancelling at the very first silent reading
+    -- for this SLEEP:900 scenario, event_count never changes again once the one
+    Bash tool_use event has landed, so *every* poll from the first block onward
+    reads equal to the one before it, whether the message gives one wait of grace
+    or none at all. The genuinely distinguishing signal is therefore not "are the
+    last two polls equal" (always true here) but "how many segments came before the
+    stop": a message that cancels on the very first silent reading only ever
+    reaches segment index 1 before the run goes terminal, while the grace-then-
+    escalate rule this plan specifies needs a first silent reading that is *not*
+    cancelled (segment 1) before the second one that is (segment 2) -- i.e. the
+    stop must sit at segment index >= 2, not just "the last segment". That is
+    exactly what `stop_idx >= 2` below checks, independently of the equal-
+    event_count check, and it is exactly what would fail against a "cancel on the
+    first silent reading" wording (stop would land at index 1).
 
     Expected RED reason: hooks/stop_wait_message.md has no stall/grace rule at all
     today (and carries no STOP_MARKER, so block detection itself may match zero
     blocks) -- a subagent following the old wording either self-polls indefinitely
-    (harness_wait_run appears, or the run is still pending well past the 3-block
-    ceiling this test allows) or never cancels at all, so
+    (harness_wait_run appears) or never cancels at all, so
     `stop_calls_per_segment.count(True) == 1` fails."""
     _skip_unless_live_available()
 
     config_dir, project_dir, artifacts_dir, run_env = _provision_stop_message_fixture(tmp_path)
-    proc = _run_stop_message_scenario(project_dir, run_env, "TOOL:Bash SLEEP:900")
+    proc = _run_stop_message_scenario(project_dir, run_env, _STALLED_DIRECTIVE)
     lines = _stream_lines(proc.stdout)
     blocks = _block_line_indices(lines)
     assert blocks, (
@@ -464,33 +540,65 @@ def test_live_stalled_run_escalates_and_ends(tmp_path, trial):
         f"expected exactly one harness_stop_run call across all segments, got "
         f"{stop_calls_per_segment.count(True)}: {stop_calls_per_segment}"
     )
-    # tautology::F2 (test-critic round 3): segment 0 is *not* the first silent
-    # reading. The harness_start_prompt response already carries
-    # event_count/last_event_at (runs.py's run_to_dict includes them
-    # unconditionally, and harness_start_prompt returns run_to_dict(result) with no
-    # override -- server.py), so it is the model's "earlier reading" baseline from
-    # the very start. By the time the first poll happens (after #64's internal
-    # wait), the fake job's one Bash tool_use event has already landed, so segment 0
-    # reads as *advanced* against that baseline ("working", plan Approach) -- not
-    # silent. The first genuinely silent reading (unchanged since segment 0, Bash
-    # still the last_activity, one wait of grace) is segment 1; escalation happens
-    # on the second consecutive silent reading, segment 2 -- exactly 3 segments
-    # (tautology::F3, docstring above).
-    #
-    # A per-segment `stop_calls_per_segment[-1]` / `not stop_calls_per_segment[-2]`
-    # position check would add nothing beyond this count + exact-length check
-    # (test-critic round 3, F4/F2): once harness_stop_run succeeds the run is
-    # CANCELLED (terminal), so the Stop hook cannot block again -- if the single
-    # True in stop_calls_per_segment sat anywhere before the last of exactly 3
-    # segments, no further segments could exist at all, contradicting
-    # `len(blocks) == 3`. So "exactly one True, exactly 3 segments" already forces
-    # the stop into the last segment and forces the first silent reading (segment
-    # 1) to have been given grace; checking position directly would be implied by,
-    # not independent of, these two.
-    assert len(blocks) == 3, (
-        f"expected exactly 3 segments: one 'advanced' reading right after the Bash "
-        f"tool_use event, one silent reading given grace, and the second silent "
-        f"reading that escalates; got {len(blocks)}: {stop_calls_per_segment}"
+    stop_idx = next(i for i, had_stop in enumerate(stop_calls_per_segment) if had_stop)
+
+    # Check 1: "the stop is in the last segment".
+    assert stop_idx == len(blocks) - 1, (
+        f"harness_stop_run was called in segment {stop_idx}, not the last of "
+        f"{len(blocks)} segments -- escalation must be the final act, nothing may "
+        f"follow it; stop_calls_per_segment={stop_calls_per_segment}"
+    )
+
+    # Check 2: "no marker line comes after it" -- an independent scan of the raw
+    # stream past the escalation segment's own end, not merely a fact implied by
+    # how `blocks` (all marker positions) was built and indexed above. Once
+    # harness_stop_run succeeds the run is CANCELLED (terminal), so the Stop hook
+    # cannot block again -- a further marker here would mean the session kept
+    # getting blocked after the cancel instead of ending.
+    stop_start, stop_end = _segment_bounds(blocks, stop_idx, len(lines))
+    remaining_lines = lines[stop_end:]
+    assert not any(STOP_MARKER in line for line in remaining_lines), (
+        f"a Stop-hook block marker appears after the escalation segment -- the "
+        f"session kept getting blocked instead of ending after harness_stop_run; "
+        f"remaining_lines={remaining_lines!r}"
+    )
+
+    # Check 3 (plan-critic gen2 round 1, misread::F1): the stop must sit at segment
+    # index >= 2 -- i.e. at least one silent reading (segment stop_idx - 1) was
+    # given grace and did *not* stop before the escalating one did. A message that
+    # cancels on the very first silent reading (no grace at all) can only ever put
+    # the stop at segment index 1, failing this check even though every poll in
+    # this SLEEP:900 scenario reads the same event_count from the first block
+    # onward (so the equal-event_count check below cannot by itself tell the two
+    # apart -- see the docstring above).
+    assert stop_idx >= 2, (
+        f"harness_stop_run was called in segment {stop_idx} (0-indexed), too early "
+        f"for a grace-then-escalate pattern -- expected at least 3 segments total: "
+        f"one advancing reading, one silent reading given grace (no stop), and the "
+        f"second consecutive silent reading that escalates; "
+        f"stop_calls_per_segment={stop_calls_per_segment}"
+    )
+
+    # Check 4: "the stop segment's poll and the previous segment's poll are both
+    # RUNNING with equal event_count" (plan Approach) -- the second consecutive
+    # silent reading that triggers escalation.
+    prev_start, prev_end = _segment_bounds(blocks, stop_idx - 1, len(lines))
+    poll_stop = _poll_result_payload(lines, stop_start, stop_end)
+    poll_prev = _poll_result_payload(lines, prev_start, prev_end)
+    assert poll_stop is not None and poll_prev is not None, (
+        f"could not read the harness_poll_run tool_result payload for the "
+        f"escalation segment or its immediate predecessor; "
+        f"poll_stop={poll_stop!r} poll_prev={poll_prev!r}"
+    )
+    assert poll_stop["state"] == "RUNNING" and poll_prev["state"] == "RUNNING", (
+        f"expected both the escalation poll and its predecessor to read the run as "
+        f"RUNNING (never terminal before the deliberate harness_stop_run cancel); "
+        f"poll_stop={poll_stop!r} poll_prev={poll_prev!r}"
+    )
+    assert poll_stop["event_count"] is not None and poll_stop["event_count"] == poll_prev["event_count"], (
+        f"expected the escalation segment's poll and the immediately preceding "
+        f"segment's poll to show the same event_count (unchanged = silent); "
+        f"poll_stop={poll_stop!r} poll_prev={poll_prev!r}"
     )
 
     assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
@@ -508,50 +616,48 @@ def test_live_stalled_run_escalates_and_ends(tmp_path, trial):
     # captured from the real escalation segment must itself have been invoked with
     # the actually-started run_id -- evidence from what the model's tool call did,
     # not from what it chose to say afterwards.
-    escalation_start = blocks[-1]
-    stop_inputs = _tool_use_inputs(lines, escalation_start, len(lines), "harness_stop_run")
+    stop_inputs = _tool_use_inputs(lines, stop_start, len(lines), "harness_stop_run")
     assert stop_inputs, (
         f"no harness_stop_run tool_use captured in the escalation segment; "
-        f"lines={lines[escalation_start:]!r}"
+        f"lines={lines[stop_start:]!r}"
     )
     assert stop_inputs[0].get("run_id") == run_id, (
         f"harness_stop_run was not called with the actually-started run_id "
         f"{run_id!r} (independent evidence from the real tool call, not the "
         f"model's self-reported summary text); stop_inputs={stop_inputs!r}"
     )
-    # tautology::F5 (test-critic round 3) / F2 (test-critic round 4, minor): round
-    # 2's `run_id in final_text` check was primed by the prompt asking the model to
-    # echo the run_id -- fixed by dropping that instruction from `_blind_prompt`
-    # (above). But round 4 found a second, independent way this check proves
-    # nothing about the *message*: even with a bare "a short one-line summary"
-    # prompt, the model already holds the run_id on its own -- it read it from the
-    # harness_start_prompt response and just passed it as an argument to
-    # harness_stop_run a moment earlier -- so naming it back in a one-line summary
-    # is unsurprising with *or without* the hook message's escalation-report
-    # instruction. Keep this assertion (it is still consistent, cheap corroboration
-    # alongside the independent stop_inputs[0] check above), but it is not by
-    # itself evidence that the *message* drove the report.
     assert run_id in final_text, f"final reply does not name the run_id {run_id!r}: {final_text!r}"
-    # The real evidence for that is the escalation-report instruction's own
-    # distinctive content: plan #65's Approach and EXPECTED_MESSAGE_TEMPLATE (see
-    # tests/test_hook.py) both specify the exact phrase "cancelled as stalled" as
-    # part of what the model is told to report. Nothing about the scenario itself
-    # (the prompt, the tool calls the model just made, or the run's own state)
-    # would lead a model to independently describe the run as "stalled" -- it
-    # cancelled the run itself via harness_stop_run, which it could equally well
-    # narrate as "cancelled" or "stopped" with no report instruction at all.
-    # "stalled" appearing in the model's own words is therefore evidence that the
-    # model read and followed the hook message's specific report clause, not just
-    # evidence that the model remembers arguments it recently passed.
-    final_lower = final_text.lower()
-    assert "stall" in final_lower, (
-        f"final reply does not report the escalation reason ('stalled') that only "
-        f"the hook message's own report instruction ('cancelled as stalled', plan "
-        f"Approach / EXPECTED_MESSAGE_TEMPLATE) could plausibly have prompted -- "
-        f"unlike run_id (which the model already held from harness_start_prompt "
-        f"and its own harness_stop_run call), nothing in the scenario would lead "
-        f"the model to say 'stalled' on its own; final_text={final_text!r}"
+
+    # Plan #65 gen2 "R2 assertion fixes" / plan-critic gen2 round 1 (untestable::F2):
+    # the report-clause check is grounded in the escalation poll's own last_activity
+    # value, but only if that value could not plausibly have reached the final
+    # reply by any other route than the model reading it off the poll result and
+    # following the message's own report instruction. Verify both exclusions
+    # directly rather than asserting them as an unverified premise.
+    last_activity = poll_stop["last_activity"]
+    assert last_activity, f"escalation poll's tool_result carried no last_activity; poll_stop={poll_stop!r}"
+    prompt_text = _blind_prompt(_STALLED_DIRECTIVE)
+    assert last_activity not in prompt_text, (
+        f"last_activity {last_activity!r} must not already appear in the "
+        f"subagent's own prompt, or its appearance in the final report would prove "
+        f"nothing about whether the model read it from the poll result; "
+        f"prompt={prompt_text!r}"
     )
+    message_text = (REPO / "hooks" / "stop_wait_message.md").read_text(encoding="utf-8")
+    assert last_activity not in message_text, (
+        f"last_activity {last_activity!r} must not already be present in the "
+        f"static hook message file itself, or its appearance in the report would "
+        f"prove nothing about whether the model read it from the poll result; "
+        f"message file={message_text!r}"
+    )
+    assert last_activity in final_text, (
+        f"final reply does not name the last_activity value {last_activity!r} that "
+        f"the escalation poll's own tool_result carried -- only the hook message's "
+        f"own report instruction (naming run_id and last_activity) could "
+        f"plausibly have prompted this, since last_activity appears neither in the "
+        f"prompt nor in hooks/stop_wait_message.md itself; final_text={final_text!r}"
+    )
+
     assert _record_state(artifacts_dir, run_id) == "CANCELLED", (
         f"run {run_id}'s record never reached CANCELLED: "
         f"{_record_state(artifacts_dir, run_id)!r}"
