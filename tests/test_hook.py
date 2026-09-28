@@ -85,6 +85,19 @@ def _running_hook(stdin_text, plugin_data, extra_env=None):
     proc = _spawn_hook(stdin_text, plugin_data, extra_env=extra_env)
     proc.stdin.write(stdin_text)
     proc.stdin.close()
+    # CPython's POSIX `Popen._communicate` unconditionally calls
+    # `self.stdin.flush()` on its first invocation whenever `self.stdin` is
+    # still a truthy attribute -- even though we already closed it above --
+    # and only suppresses `BrokenPipeError`, not the `ValueError: I/O
+    # operation on closed file.` that flushing an already-closed stream
+    # raises. That made every test below's own `proc.communicate(...)` call
+    # blow up on Linux (never on Windows, whose `_communicate` instead
+    # spawns reader/writer threads and only closes -- never flushes -- an
+    # already-closed stdin, which is a harmless no-op). Clearing the
+    # attribute once we're done with it tells `communicate()` there is no
+    # stdin pipe left to manage, matching the state a caller who never
+    # touched stdin directly would be in.
+    proc.stdin = None
     try:
         yield proc
     finally:
