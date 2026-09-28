@@ -832,7 +832,11 @@ def test_stop_blocks_after_wait_timeout(tmp_path):
     all), so `elapsed >= 2.0` fails."""
     plugin_data = tmp_path / "plugin-data"
     artifacts_dir = tmp_path / "artifacts"
-    extra_env = {"HARNESS_ARTIFACTS_DIR": str(artifacts_dir), "HARNESS_STOP_WAIT_TIMEOUT_SECONDS": "2"}
+    timeout_seconds = 2.0
+    extra_env = {
+        "HARNESS_ARTIFACTS_DIR": str(artifacts_dir),
+        "HARNESS_STOP_WAIT_TIMEOUT_SECONDS": str(timeout_seconds),
+    }
     session_id = "sess-timeout"
     run_id = "run-timeout"
 
@@ -845,7 +849,18 @@ def test_stop_blocks_after_wait_timeout(tmp_path):
 
     assert stop.returncode == 2, f"stdout={stop.stdout!r} stderr={stop.stderr!r}"
     assert run_id in stop.stderr
-    assert elapsed >= 2.0, f"elapsed={elapsed}"
+    assert elapsed >= timeout_seconds, f"elapsed={elapsed}"
+    # tautology::F1: also bound how much *longer* than the configured env var
+    # the hook may take, so this pins the implementation to actually reading
+    # HARNESS_STOP_WAIT_TIMEOUT_SECONDS (`timeout_seconds` above) rather than
+    # a hardcoded deadline that happens to also be >= 2.0 (e.g. the old 7200s
+    # default, or a bug that ignored the env var and used a much longer
+    # fixed wait). Margin covers poll-interval slop and process overhead.
+    assert elapsed < timeout_seconds + 5, (
+        f"hook took {elapsed:.2f}s to exit, expected close to the configured "
+        f"{timeout_seconds}s timeout (plus poll/process overhead); "
+        f"stdout={stop.stdout!r} stderr={stop.stderr!r}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -945,6 +960,25 @@ def test_stop_message_rendered_from_file(tmp_path):
         stop = run_hook(json.dumps(_stop_payload(session_id)), plugin_data, extra_env=extra_env)
         assert stop.returncode == 2, f"stdout={stop.stdout!r} stderr={stop.stderr!r}"
         assert run_id in stop.stderr
+        # tautology::F2: `run_id in stop.stderr` alone would also pass a hook
+        # that appended run_id somewhere unrelated to the {run_ids}
+        # placeholder (e.g. always tacked on at the end, ignoring the
+        # template's own layout). Locate the placeholder's fixed prefix in
+        # the rendered output and require run_id to start exactly there --
+        # i.e. genuinely substituted at the placeholder's position, not just
+        # present somewhere in stderr.
+        prefix, _, _ = template_text.partition("{run_ids}")
+        prefix_at = stop.stderr.find(prefix)
+        assert prefix_at != -1, (
+            f"template's own fixed prefix before {{run_ids}} not found verbatim "
+            f"in stderr; stderr={stop.stderr!r}"
+        )
+        after_prefix = stop.stderr[prefix_at + len(prefix):]
+        assert after_prefix.startswith(run_id), (
+            f"run_id must be substituted exactly at the {{run_ids}} placeholder's "
+            f"position, not merely present elsewhere in stderr; "
+            f"after_prefix={after_prefix!r}"
+        )
         return stop.stderr
 
     try:

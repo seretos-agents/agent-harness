@@ -15,10 +15,16 @@ work it has already done is still running and still paid for.
 
 There is also no ending your own turn on it. If you started this run (`harness_start_agent`,
 `harness_start_prompt` or `harness_send_message`) in the current session, a `Stop` hook
-blocks turn-end until it reaches a terminal state - you cannot fall back on hoping to be
-"woken up" later to collect the result. Keep waiting (path A or B below) or call
-`harness_stop_run` on it; `harness_cleanup_run` is denied while it is still non-terminal, so
-it is not a way around the block either.
+waits internally, re-checking the run roughly every 0.5s, until it reaches a terminal state
+- you do not need to spend a tool call or a model turn polling it yourself, and you cannot
+fall back on hoping to be "woken up" later to collect the result. The internal wait's own
+limit is `HARNESS_STOP_WAIT_TIMEOUT_SECONDS` (default and ceiling 7200s; `0` means a single
+snapshot). Only once that elapses does the hook give up and block turn-end (exit 2, its
+stderr message rendered from the plugin's `hooks/stop_wait_message.md`, naming the pending
+`run_id`(s)) - and even then the run itself is left exactly as it was, still RUNNING, never
+cancelled. Keep waiting (path A or B below) or call `harness_stop_run` on it;
+`harness_cleanup_run` is denied while it is still non-terminal, so it is not a way around the
+block either.
 
 An elapsed limit is not news about the run. It tells you only that the run needed longer
 than you allowed it this time; it says nothing about whether the run is healthy. What the

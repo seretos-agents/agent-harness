@@ -32,7 +32,7 @@
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/harness\" hook", "timeout": 10 }
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/harness\" hook", "timeout": 7500 }
         ]
       }
     ]
