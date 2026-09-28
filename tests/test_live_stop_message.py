@@ -45,6 +45,27 @@ _TRIALS = 3
 # set 15").
 _STOP_WAIT_TIMEOUT_SECONDS = 15
 
+# tautology::F2 (test-critic round 5, major): the original "TICK:8:5" directive (40s
+# of tick-phase sleep) reliably produced only ~2 blocks against a 15s internal wait
+# (write_context.py's Stop handler blocks for exactly stop_wait_timeout() once the run
+# is still pending, so each cycle costs ~15s of internal wait plus one real model
+# turn's latency) -- the run tends to reach COMPLETED during the third hook wait
+# rather than surviving it, so R1 (below) never reached a third reading. That let a
+# wording which ignores event_count/last_event_at entirely and just counts
+# reactivations to a fixed N (e.g. "cancel on the third reactivation") pass R1 for
+# free, because the run finished before a third reading ever happened -- R1's
+# `assert not stops` per segment was never exercised against that trap. Widened to
+# 20 ticks so the tick phase alone spans ~100s, comfortably more than 3 full
+# (wait + real-turn-latency) cycles even under slow model API latency, so the ≥3
+# block floor below (R1_MIN_BLOCKS) is reliably reachable rather than a coin flip.
+_WORKING_RUN_DIRECTIVE = "TICK:20:5"
+
+# tautology::F2 (test-critic round 5, major): see _WORKING_RUN_DIRECTIVE above --
+# R1 must reach at least a third reading of a still-advancing run, or a wording that
+# ignores event_count/last_event_at and just counts reactivations to a fixed N could
+# pass by having the run finish before the trap N is ever reached.
+R1_MIN_BLOCKS = 3
+
 
 def _provision_stop_message_fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, str]]:
     """Marketplace-install a fixture plugin carrying this repo's own hooks/hooks.json
@@ -298,11 +319,21 @@ def _skip_unless_live_available() -> None:
 @pytest.mark.parametrize("trial", range(_TRIALS))
 def test_live_blocked_working_run_is_not_self_polled(tmp_path, trial):
     """R1 driving test: a run that keeps making visible progress (TICK) blocks the
-    Stop hook one or more times; after each block the subagent must call
+    Stop hook at least three times; after each block the subagent must call
     harness_poll_run exactly once and nothing else (no harness_wait_run, no
     harness_stop_run, no shell `harness wait`), and the session ends normally
     (exit 0, a non-error terminal result) once the run completes, with the real run
     record reaching COMPLETED.
+
+    tautology::F2 (test-critic round 5, major): a floor of "at least 1 block" let a
+    wording that ignores event_count/last_event_at and just counts reactivations to
+    a fixed N (e.g. "cancel on the third reactivation, no matter what") pass this
+    test for free whenever the TICK run happened to finish within two hook waits --
+    the third reading, where that trap would fire and this test's `assert not
+    stops` would catch it, never happened. _WORKING_RUN_DIRECTIVE is tuned (see its
+    definition above) so the run reliably needs at least R1_MIN_BLOCKS=3 hook-wait
+    cycles to finish, forcing a genuinely repeated "RUNNING + advanced -> keep
+    waiting, no cancel" judgement rather than just one.
 
     Expected RED reason: hooks/stop_wait_message.md today tells the model to "call
     harness_wait_run / harness_poll_run until they are terminal" and carries no
@@ -314,12 +345,20 @@ def test_live_blocked_working_run_is_not_self_polled(tmp_path, trial):
     _skip_unless_live_available()
 
     config_dir, project_dir, artifacts_dir, run_env = _provision_stop_message_fixture(tmp_path)
-    proc = _run_stop_message_scenario(project_dir, run_env, "TICK:8:5")
+    proc = _run_stop_message_scenario(project_dir, run_env, _WORKING_RUN_DIRECTIVE)
     lines = _stream_lines(proc.stdout)
     blocks = _block_line_indices(lines)
     assert blocks, (
         f"zero Stop-hook blocks matched (marker {STOP_MARKER!r} never seen in "
         f"stdout); full dump: stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert len(blocks) >= R1_MIN_BLOCKS, (
+        f"only {len(blocks)} block(s) matched, expected at least {R1_MIN_BLOCKS} -- "
+        f"the run finished before a third reading of a still-advancing run could "
+        f"happen, so a wording that ignores event_count/last_event_at and just "
+        f"counts reactivations to a fixed N was never actually exercised against "
+        f"its trap (test-critic round 5, tautology::F2); consider widening "
+        f"_WORKING_RUN_DIRECTIVE further if this recurs. stdout={proc.stdout!r}"
     )
 
     for idx, block_at in enumerate(blocks):
