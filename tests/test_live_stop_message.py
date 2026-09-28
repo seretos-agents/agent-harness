@@ -7,10 +7,18 @@ Deselected by default; run with
 `python -m pytest -m live tests/test_live_stop_message.py -p no:cacheprovider`
 (needs the real `claude` CLI on PATH plus real credentials; skips otherwise).
 
-Per plan #65 "Completion": these two scenarios are supplementary, driving-test
-evidence -- pass, fail, or "not run" (no `claude` CLI / no credentials) never
-blocks the package's completion. R3 in tests/test_hook.py is the PR-CI-gating
-offline evidence.
+Per plan #65 "Completion" (round 5, in response to test-critic F1): R3 in
+tests/test_hook.py is the PR-CI-gating offline evidence -- CI cannot run this
+module (no real `claude` credentials there), so this module's *result*
+(pass/fail) never gates the PR-CI check. But the run itself is not optional:
+the implement-phase developer must actually execute
+`python -m pytest -m live tests/test_live_stop_message.py -p no:cacheprovider`
+against the real shipped hooks/stop_wait_message.md at least once per scenario
+(R1, R2) and paste the real output (pass/fail, timings) into the change report
+and PR body -- developer-verified evidence that a wrong wording cannot fake,
+closing the loop a static string-equality check like R3's cannot close on its
+own. A run that could not happen at all (no `claude` CLI / no credentials) is
+a reported blocker, never a silently skipped step.
 """
 from __future__ import annotations
 

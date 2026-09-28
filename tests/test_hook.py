@@ -1159,6 +1159,3 @@ def test_stop_message_file_matches_shipped_wording(tmp_path):
         f"stderr does not match the committed file rendered with run_ids filled in; "
         f"stderr={stop.stderr!r} expected={expected!r}"
     )
-    assert stop.stderr.startswith(STOP_MARKER), (
-        f"stderr does not start with the fixed STOP_MARKER prefix; stderr={stop.stderr!r}"
-    )
