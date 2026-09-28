@@ -359,8 +359,18 @@ def test_live_stalled_run_escalates_and_ends(tmp_path, trial):
     """R2 driving test: a run that goes silent right after one Bash tool_use (a
     call that can legitimately run long) gets one silent reading's grace -- no
     cancel on the first silent block -- and is only cancelled (harness_stop_run) on
-    the second consecutive silent reading; the final reply names the run_id. Never
-    more than one poll per block, never harness_wait_run.
+    the second consecutive silent reading; the final reply names the run_id and
+    reports the run as stalled. Never more than one poll per block, never
+    harness_wait_run.
+
+    tautology::F2 (test-critic round 4, minor): `run_id in final_text` alone proves
+    little -- the model already holds the run_id from harness_start_prompt and from
+    its own harness_stop_run call, so it can name the run_id in a one-line summary
+    whether or not the hook message ever told it to report anything. The
+    `"stall" in final_text.lower()` assertion near the end of this test is the
+    check that is actually tied to the message's specific escalation-report clause
+    ("cancelled as stalled", plan Approach / EXPECTED_MESSAGE_TEMPLATE) -- nothing
+    else in the scenario would lead the model to describe the run that way.
 
     tautology::F3 (test-critic round 3): the plan's own timeline is exact, not a
     range -- segment 0 reads advanced (the Bash tool_use event already landed by
@@ -462,16 +472,39 @@ def test_live_stalled_run_escalates_and_ends(tmp_path, trial):
         f"{run_id!r} (independent evidence from the real tool call, not the "
         f"model's self-reported summary text); stop_inputs={stop_inputs!r}"
     )
-    # tautology::F5 (test-critic round 3): round 2's `run_id in final_text` check
-    # was still primed -- `_blind_prompt` explicitly asked the model to include the
-    # run_id in its summary, so this held even for a hook message with no report
-    # instruction at all. `_blind_prompt` (above) now asks only for "a short
-    # one-line summary", dropping that instruction, so the only remaining source
-    # that can put the run_id into final_text is the hook message's own escalation
-    # report instruction ("end with a report naming the run_id ...", plan
-    # Approach) -- this assertion is now real evidence that the message drives the
-    # report, not an echo of the prompt.
+    # tautology::F5 (test-critic round 3) / F2 (test-critic round 4, minor): round
+    # 2's `run_id in final_text` check was primed by the prompt asking the model to
+    # echo the run_id -- fixed by dropping that instruction from `_blind_prompt`
+    # (above). But round 4 found a second, independent way this check proves
+    # nothing about the *message*: even with a bare "a short one-line summary"
+    # prompt, the model already holds the run_id on its own -- it read it from the
+    # harness_start_prompt response and just passed it as an argument to
+    # harness_stop_run a moment earlier -- so naming it back in a one-line summary
+    # is unsurprising with *or without* the hook message's escalation-report
+    # instruction. Keep this assertion (it is still consistent, cheap corroboration
+    # alongside the independent stop_inputs[0] check above), but it is not by
+    # itself evidence that the *message* drove the report.
     assert run_id in final_text, f"final reply does not name the run_id {run_id!r}: {final_text!r}"
+    # The real evidence for that is the escalation-report instruction's own
+    # distinctive content: plan #65's Approach and EXPECTED_MESSAGE_TEMPLATE (see
+    # tests/test_hook.py) both specify the exact phrase "cancelled as stalled" as
+    # part of what the model is told to report. Nothing about the scenario itself
+    # (the prompt, the tool calls the model just made, or the run's own state)
+    # would lead a model to independently describe the run as "stalled" -- it
+    # cancelled the run itself via harness_stop_run, which it could equally well
+    # narrate as "cancelled" or "stopped" with no report instruction at all.
+    # "stalled" appearing in the model's own words is therefore evidence that the
+    # model read and followed the hook message's specific report clause, not just
+    # evidence that the model remembers arguments it recently passed.
+    final_lower = final_text.lower()
+    assert "stall" in final_lower, (
+        f"final reply does not report the escalation reason ('stalled') that only "
+        f"the hook message's own report instruction ('cancelled as stalled', plan "
+        f"Approach / EXPECTED_MESSAGE_TEMPLATE) could plausibly have prompted -- "
+        f"unlike run_id (which the model already held from harness_start_prompt "
+        f"and its own harness_stop_run call), nothing in the scenario would lead "
+        f"the model to say 'stalled' on its own; final_text={final_text!r}"
+    )
     assert _record_state(artifacts_dir, run_id) == "CANCELLED", (
         f"run {run_id}'s record never reached CANCELLED: "
         f"{_record_state(artifacts_dir, run_id)!r}"

@@ -1046,6 +1046,21 @@ STOP_MARKER = "agent-harness Stop hook: waited for unfinished run(s)"
 # a fixed literal since the real committed file's content, not an arbitrary swapped
 # template, is what must match).
 #
+# tautology::F1 (test-critic round 3 -- critical): fixing round 2's paraphrase gap
+# with an exact-match assertion has a cost the round-3 critic correctly names: proving
+# "the shipped file equals this literal" is not the same as proving "this literal's
+# wording actually stops a real subagent from aborting or self-polling" -- no offline
+# string check can prove the latter, only a real model reading and acting on the text
+# can. That is not a gap to paper over here; it is the same class of gap plan #65's
+# own Frame already accepts and explicitly instructs not to plan around ("this
+# package's own PR run cannot produce that evidence; do not plan for it, and its
+# absence is not a gap"). test_stop_message_file_matches_shipped_wording below (renamed
+# from test_stop_sends_committed_message_file for exactly this reason) is honest in
+# its name and docstring about being the offline pinning + hook-plumbing evidence,
+# not the behavioral evidence -- tests/test_live_stop_message.py's R1/R2 scenarios are
+# the (supplementary, non-gating) behavioral evidence, and plan #65's Completion
+# section states the split explicitly.
+#
 # This is the literal content #65 commits hooks/stop_wait_message.md to. Every
 # clause in it is required by plan #65's Approach section: the fixed STOP_MARKER
 # first line: "First line is the fixed marker ... then {run_ids}"; "do not abort; no
@@ -1082,14 +1097,33 @@ EXPECTED_MESSAGE_TEMPLATE = (
 )
 
 
-def test_stop_sends_committed_message_file(tmp_path):
-    """R3 driving test: a real Stop subprocess, blocked on one tracked RUNNING run,
+def test_stop_message_file_matches_shipped_wording(tmp_path):
+    """R3 driving test -- OFFLINE PINNING + PLUMBING, not behavioral proof.
+
+    tautology::F1 (test-critic round 3, critical): this test's exact-match assertion
+    proves the shipped hooks/stop_wait_message.md equals the test's own copy of the
+    text (EXPECTED_MESSAGE_TEMPLATE) and that the existing #62/#64 hook plumbing --
+    exit 2, the `{run_ids}` str.replace substitution -- renders that exact file on a
+    real Stop subprocess. That is genuinely what it proves, no more: a static
+    string-equality check cannot show that this wording actually achieves the
+    ticket's behavioral goal (stopping a real subagent from aborting or self-polling,
+    driving it to judge plausibility and escalate correctly) -- only a real model
+    reading and acting on the text can demonstrate that. Renamed from
+    `test_stop_sends_committed_message_file` (round 1-3) precisely so the name no
+    longer implies more than this.
+
+    That behavioral proof is not missing evidence for this package: it is
+    tests/test_live_stop_message.py's R1/R2 scenarios (`test_live_blocked_working_run_is_not_self_polled`,
+    `test_live_stalled_run_escalates_and_ends`), which plan #65's Frame documents as
+    supplementary, non-gating live evidence -- this package's own PR run cannot
+    produce that evidence, and per Frame its absence here is not a gap. This test is
+    the one PR-CI-gating, offline-provable piece: exact wording + hook plumbing. See
+    plan #65's Completion section for the fuller statement of this split.
+
+    Mechanically: a real Stop subprocess, blocked on one tracked RUNNING run,
     renders the *actual committed* hooks/stop_wait_message.md (not a swapped-in
     template like test_stop_message_rendered_from_file uses) -- stderr is exactly
-    that file's `{run_ids}` placeholder filled in with `run-x (RUNNING)`, and the
-    committed file's own text equals EXPECTED_MESSAGE_TEMPLATE above verbatim (not
-    just "contains the marker" or "contains some keywords") -- the specific final
-    wording #65 commits to, decided before the implementation exists.
+    that file's `{run_ids}` placeholder filled in with `run-x (RUNNING)`.
 
     Expected RED reason: the current committed file reads "agent-harness: run(s)
     {run_ids} started in this session are not finished; call harness_wait_run /
