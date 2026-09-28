@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 authors = [{ name = "Arne von Appen" }]
 dependencies = [
   "mcp>=1.2,<2",
-  "lib-python-harness @ git+https://github.com/seretos-agents/lib-python-harness@v0.0.9",
+  "lib-python-harness @ git+https://github.com/seretos-agents/lib-python-harness@v0.0.10",
 ]
 
 [project.optional-dependencies]
