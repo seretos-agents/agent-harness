@@ -216,10 +216,30 @@ def _run_stop_message_scenario(project_dir: Path, run_env: dict[str, str], direc
     # touching the shipped message. Denying it does not narrow what these scenarios
     # exercise: neither R1 nor R2's directives need the model to defer its own
     # reactivation -- that is exactly the job the Stop hook already does.
+    #
+    # #65 gen2 round-2 FAIL (live), second finding: even with ScheduleWakeup denied,
+    # `haiku` still frequently never lets the turn end at all -- it calls
+    # `harness_wait_run` directly, in the same turn as `harness_start_prompt`, before
+    # any Stop-hook block can happen (live-evidence-round-2.md: only 4/13 trials
+    # across that round's runs reached a real block; every zero-block failure's
+    # captured stdout has no `"hook_event":"Stop"` entry and no STOP_MARKER line, i.e.
+    # hooks/stop_wait_message.md is never even read in those trials). That is a
+    # general instruction-following gap (see the "not any tool to check on the job or
+    # its status" directive in `_blind_prompt` above), unrelated to what this file's
+    # message says -- the message is only ever read *after* the turn has already
+    # ended and the hook has blocked. `harness_wait_run` itself cannot be denied via
+    # `--disallowedTools` the way ScheduleWakeup was without invalidating R1's own
+    # `assert not waits` (the tool would be structurally uncallable rather than
+    # merely unused). So this module pins `sonnet` instead of the repo-wide `haiku`
+    # convention (see tests/test_live_claude.py, left unchanged -- its scenarios
+    # don't depend on strict single-tool-call-then-immediately-stop compliance the
+    # way this module's blind prompt does): a general "call exactly one tool, then
+    # end your turn" compliance requirement, not anything this ticket's own
+    # production wording could fix.
     return subprocess.run(
         [
             "claude", "-p", _blind_prompt(directive),
-            "--model", "haiku",
+            "--model", "sonnet",
             "--permission-mode", "bypassPermissions",
             "--disallowedTools", "ScheduleWakeup",
             "--output-format", "stream-json",
