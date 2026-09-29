@@ -42,7 +42,14 @@ from `harness_plugin.runs` (only Stop pays for that import) and fails open
 (`try/except Exception: pass`) -- the passive `record.json` read right after
 it is the existing, unchanged fallback, so a `_drive_run` failure (e.g. a
 record with no pid, as #62/#64's seeded test records have) degrades to
-exactly the old behaviour rather than blocking Stop."""
+exactly the old behaviour rather than blocking Stop.
+
+#72: no logic change here. lib_python_harness v0.0.11 also finalizes a child
+that is gone (exited normally) when observed from a *separate* process than
+the one that spawned it, because the grace window is anchored on the durable
+last-sign-of-life rather than on in-process state. So the Stop loop's repeated
+`wait(run_id, 0)` calls converge on a terminal state without any
+`wait(run_id, GRACE+1)` workaround."""
 from __future__ import annotations
 
 import json
@@ -204,7 +211,11 @@ def _drive_run(run_id: str) -> None:
     other hook event never imports the lib at all. Fails open
     (`try/except Exception: pass`): a record with no pid (e.g. #62/#64's
     seeded test records) or any other error here must fall through to the
-    unchanged passive read, never block Stop."""
+    unchanged passive read, never block Stop.
+
+    #72: with lib_python_harness v0.0.11 a gone child held by another process
+    is finalized too (the grace window is anchored on the durable last sign
+    of life), so repeated `wait(run_id, 0)` calls from this loop converge."""
     try:
         from harness_plugin.runs import harness
 

@@ -39,7 +39,12 @@ interaction, not anything this ticket's fix touches (no production code
 here calls `_cli_version` differently) -- so every test that measures a
 grace-kill's own latency through an async MCP tool call warms that cache
 with a throwaway trivial run first, keeping `BUDGET` a measurement of the
-grace-kill, not of an unrelated one-time subprocess-spawn cost."""
+grace-kill, not of an unrelated one-time subprocess-spawn cost.
+
+#72: a child that exited normally (not lingering) but whose record is held by
+another process is finalized by the Stop hook's repeated `wait(run_id, 0)`
+under lib_python_harness v0.0.11 (grace anchored on durable last sign of
+life); see the "#72" section below for the driving test."""
 import json
 import time
 
