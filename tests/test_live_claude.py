@@ -1334,3 +1334,45 @@ def test_live_clean_prompt_child_exits(live_server_params, tmp_path):
     assert _pid_status(pid, record.get("start_time")) is False, (
         "the run's OS child process is still alive after COMPLETED was reported"
     )
+
+
+# --- Stop finalizes a normally-exited real child held by another process (#72) -----
+
+
+@pytest.mark.timeout(300)
+def test_live_stop_hook_completes_exited_child(live_server_params, tmp_path):
+    """#72 (live variant of tests/test_lingering_child.py's
+    test_stop_hook_completes_exited_child_held_by_other_process): a real
+    `claude -p` child (haiku, "Reply OK") exits on its own while the MCP server
+    keeps its `Popen`; the real Stop hook must then finalize the run and exit 0
+    within BUDGET of its own start, not block for its wait limit.
+
+    Expected RED reason (lib_python_harness v0.0.10): Stop never finalizes and
+    exits 2 after its wait limit. Opt-in evidence only; the default suite's
+    fake-CLI test is the deterministic proof."""
+    if shutil.which("claude") is None:
+        pytest.skip("the real `claude` CLI is not on PATH")
+    from lib_python_harness import RunState
+    from test_lingering_child import BUDGET, _cleanup, _record, _stop_after_exited_child
+
+    artifacts_dir = tmp_path / "artifacts"
+    plugin_data = tmp_path / "plugin-data"
+    run_id = None
+
+    async def scenario(session):
+        return await _stop_after_exited_child(
+            session, artifacts_dir, plugin_data, "sess-72-live", "Reply OK", "haiku", 120
+        )
+
+    try:
+        run_id, stop, stop_elapsed = _run(scenario, live_server_params)
+        assert stop.returncode == 0, (
+            f"expected Stop to finalize the exited run within {BUDGET}s; "
+            f"stdout={stop.stdout!r} stderr={stop.stderr!r}"
+        )
+        assert stop_elapsed <= BUDGET, f"Stop took {stop_elapsed:.2f}s, budget {BUDGET}s"
+        record = _record(artifacts_dir, run_id)
+        assert record is not None and record.get("state") == RunState.COMPLETED, record
+    finally:
+        if run_id is not None:
+            _cleanup(live_server_params, artifacts_dir, run_id)
