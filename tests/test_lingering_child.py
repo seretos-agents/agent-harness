@@ -39,7 +39,12 @@ interaction, not anything this ticket's fix touches (no production code
 here calls `_cli_version` differently) -- so every test that measures a
 grace-kill's own latency through an async MCP tool call warms that cache
 with a throwaway trivial run first, keeping `BUDGET` a measurement of the
-grace-kill, not of an unrelated one-time subprocess-spawn cost."""
+grace-kill, not of an unrelated one-time subprocess-spawn cost.
+
+#72: a child that exited normally (not lingering) but whose record is held by
+another process is finalized by the Stop hook's repeated `wait(run_id, 0)`
+under lib_python_harness v0.0.11 (grace anchored on durable last sign of
+life); see the "#72" section below for the driving test."""
 import json
 import time
 
@@ -276,3 +281,78 @@ def test_wait_cli_completes_lingering_child(server_params, wait_run_env, wait_ru
         assert _child_gone(artifacts_dir, run_id), "the lingering child is still alive"
     finally:
         _cleanup(server_params, artifacts_dir, run_id)
+
+
+# --- #72: Stop finalizes a normally-exited child held by another process ----
+
+
+async def _stop_after_exited_child(
+    session, artifacts_dir, plugin_data, session_id, prompt, model, exit_cap_s
+):
+    """Start a real run through `session` (the MCP server -- a different, still
+    living process -- keeps the run's `Popen`), wait until the `claude -p`
+    child has exited on its own, then run the real Stop hook and time it from
+    its own start. Nobody but Stop may finalize the run: the server has no
+    background reaper and gets no poll/wait call here, so the record must
+    still read RUNNING when Stop starts.
+
+    Returns `(run_id, stop, stop_elapsed)`."""
+    extra_env = {"HARNESS_ARTIFACTS_DIR": str(artifacts_dir)}
+    is_error, text, started = await _call(
+        session, "harness_start_prompt", prompt=prompt, model=model
+    )
+    assert not is_error, text
+    run_id = started["run_id"]
+
+    deadline = time.monotonic() + exit_cap_s
+    while not await anyio.to_thread.run_sync(_child_gone, artifacts_dir, run_id):
+        assert time.monotonic() < deadline, f"child of {run_id} never exited within {exit_cap_s}s"
+        await anyio.sleep(0.1)
+    record = _record(artifacts_dir, run_id)
+    assert record.get("state") == RunState.RUNNING, (
+        f"precondition: only Stop may finalize the run, but it is already {record}"
+    )
+
+    await anyio.to_thread.run_sync(
+        _track, plugin_data, extra_env, session_id, "mcp__harness__harness_start_prompt", run_id
+    )
+    stop_env = dict(extra_env)
+    stop_env["HARNESS_STOP_WAIT_TIMEOUT_SECONDS"] = str(BUDGET + 30)
+    stop_start = time.monotonic()
+    stop = await anyio.to_thread.run_sync(
+        run_hook, json.dumps(_stop_payload(session_id)), plugin_data, "/work/project", stop_env
+    )
+    return run_id, stop, time.monotonic() - stop_start
+
+
+def test_stop_hook_completes_exited_child_held_by_other_process(server_params, tmp_path):
+    """#72 R1 driving test: the child exited normally right after writing its
+    result, while the MCP server (another living process) still holds its
+    `Popen`. The real Stop hook must finalize the run and exit 0 within
+    `BUDGET` of its own start, not block for its wait limit
+    (`HARNESS_STOP_WAIT_TIMEOUT_SECONDS` = BUDGET + 30).
+
+    Expected RED reason (lib_python_harness v0.0.10): each `wait(run_id, 0)`
+    restarts a loop-local `gone_since`, so Stop never finalizes and exits 2
+    after BUDGET + 30s naming the run."""
+    plugin_data = tmp_path / "plugin-data"
+    artifacts_dir = tmp_path / "artifacts"
+    run_id = None
+
+    async def scenario(session):
+        return await _stop_after_exited_child(
+            session, artifacts_dir, plugin_data, "sess-72-stop", "OK", "sonnet", 15
+        )
+
+    try:
+        run_id, stop, stop_elapsed = _run(scenario, server_params)
+        assert stop.returncode == 0, (
+            f"expected Stop to finalize the exited run within {BUDGET}s, not block on "
+            f"the {BUDGET + 30}s wait limit; stdout={stop.stdout!r} stderr={stop.stderr!r}"
+        )
+        assert stop_elapsed <= BUDGET, f"Stop took {stop_elapsed:.2f}s, budget {BUDGET}s"
+        record = _record(artifacts_dir, run_id)
+        assert record is not None and record.get("state") == RunState.COMPLETED, record
+    finally:
+        if run_id is not None:
+            _cleanup(server_params, artifacts_dir, run_id)
