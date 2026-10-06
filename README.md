@@ -113,6 +113,10 @@ The child inherits the parent session's permission mode and effort from the sess
 
 `harness run-agent --subagent-type <name> --prompt <text> [--model <m>] [--description <label>]` starts the run, blocks until it ends and prints one JSON object shaped like `harness_poll_run`'s result. It has no timeout and never cancels the run.
 
+### `harness send-message`
+
+`harness send-message --to <run_id> --message <text>` continues a finished run: `<run_id>` is the `agentId` a native `Agent` call returned. The plugin's hooks module answers a native `SendMessage` whose `to` is such a run id with it (any other recipient -- `main`, a teammate, a native agent id -- stays native). It follows the persisted `resumed_from` links to the newest run of that chain (so repeated messages to the original id keep one conversation, even if `claude --resume` forks a session), resumes it with the origin's isolation, cwd and flags, blocks until the reply is in and prints one JSON object shaped like `harness_poll_run`'s result (with `resumed_from`). Exit codes as for `run-agent` (0/1/3), 4 on an error such as an unknown or still RUNNING run (message on stderr). No timeout, never cancels.
+
 | exit | meaning |
 | --- | --- |
 | 0 | run COMPLETED |

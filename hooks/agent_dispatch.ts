@@ -30,6 +30,36 @@ function fail(text: string) {
   return { result: { isError: true, text } }
 }
 
+/** Run `harness <argv>` and map its exit code to the native tool result (0 completed; 1/3 failed/cancelled run; else error). */
+async function runHarness($: { process: { spawn: (...a: any[]) => Promise<unknown> }; plugin: { root: string } }, argv: string[], what: string) {
+  const done = (await $.process.spawn(binaryOf($.plugin.root), argv)) as Spawned
+  const code = done.exitCode ?? done.code ?? done.status
+  const stdout = (done.stdout ?? '').trim()
+  const stderr = (done.stderr ?? '').trim()
+
+  if (code === 0 || code === 1 || code === 3) {
+    const run = JSON.parse(stdout.split('\n').filter(line => line.trim() !== '').pop() ?? '{}') as Record<string, unknown>
+    const text = typeof run.text === 'string' ? run.text : ''
+
+    if (code !== 0) {
+      return fail(`harness run ${String(run.run_id)} ended ${String(run.state)}: ${text}`)
+    }
+
+    return {
+      result: {
+        status: 'completed',
+        agentId: run.run_id,
+        content: [{ type: 'text', text }],
+        usage: run.usage ?? {},
+      },
+    }
+  }
+
+  return fail(`${BUILTIN_RESULT_NOTE}: ${stderr !== '' ? stderr : `harness ${what} exited ${String(code)}`}`)
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
 export function register(on: On) {
   on('tool.call', { tool: ['Agent', 'Task'] }, async ($, e) => {
     try {
@@ -53,30 +83,24 @@ export function register(on: On) {
         argv.push('--description', description)
       }
 
-      const done = (await $.process.spawn(binaryOf($.plugin.root), argv)) as Spawned
-      const code = done.exitCode ?? done.code ?? done.status
-      const stdout = (done.stdout ?? '').trim()
-      const stderr = (done.stderr ?? '').trim()
+      return await runHarness($, argv, 'run-agent')
+    } catch (error) {
+      return fail(`${BUILTIN_RESULT_NOTE}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  })
+  // #78: a SendMessage whose `to` is a harness run id (a canonical UUID -- what `Agent`
+  // returned as `agentId`) resumes that run's chain; any other recipient stays native.
+  on('tool.call', { tool: ['SendMessage'] }, async ($, e, next) => {
+    try {
+      const args = e as unknown as Readonly<Record<string, unknown>>
+      const to = args.to
+      const message = args.message
 
-      if (code === 0 || code === 1 || code === 3) {
-        const run = JSON.parse(stdout.split('\n').filter(line => line.trim() !== '').pop() ?? '{}') as Record<string, unknown>
-        const text = typeof run.text === 'string' ? run.text : ''
-
-        if (code !== 0) {
-          return fail(`harness run ${String(run.run_id)} ended ${String(run.state)}: ${text}`)
-        }
-
-        return {
-          result: {
-            status: 'completed',
-            agentId: run.run_id,
-            content: [{ type: 'text', text }],
-            usage: run.usage ?? {},
-          },
-        }
+      if (typeof to !== 'string' || !UUID.test(to) || typeof message !== 'string' || message.trim() === '') {
+        return next(e)
       }
 
-      return fail(`${BUILTIN_RESULT_NOTE}: ${stderr !== '' ? stderr : `harness run-agent exited ${String(code)}`}`)
+      return await runHarness($, ['send-message', '--to', to, '--message', message], 'send-message')
     } catch (error) {
       return fail(`${BUILTIN_RESULT_NOTE}: ${error instanceof Error ? error.message : String(error)}`)
     }

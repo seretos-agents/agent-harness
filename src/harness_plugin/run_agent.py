@@ -20,6 +20,8 @@ from harness_plugin.runs import (
     LAUNCHED_SESSION_ENV,
     StartRefused,
     harness,
+    newest_in_chain,
+    resume_run,
     run_to_dict,
     start_agent,
 )
@@ -68,6 +70,17 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+def _emit(result, **extra) -> int:
+    """Print the run as one `run_to_dict` JSON line and map its state to the exit code."""
+    sys.stdout.write(json.dumps(run_to_dict(result, **extra)) + "\n")
+    sys.stdout.flush()
+    return {
+        RunState.COMPLETED: EXIT_COMPLETED,
+        RunState.FAILED: EXIT_FAILED,
+        RunState.CANCELLED: EXIT_CANCELLED,
+    }.get(result.state, EXIT_ERROR)
+
+
 def main(argv: list[str]) -> int:
     args = _parser().parse_args(argv)
     agent = args.subagent_type
@@ -98,10 +111,28 @@ def main(argv: list[str]) -> int:
     except (StartRefused, HarnessError, OSError) as exc:
         print(f"harness run-agent: {exc}", file=sys.stderr)
         return EXIT_ERROR
-    sys.stdout.write(json.dumps(run_to_dict(result)) + "\n")
-    sys.stdout.flush()
-    return {
-        RunState.COMPLETED: EXIT_COMPLETED,
-        RunState.FAILED: EXIT_FAILED,
-        RunState.CANCELLED: EXIT_CANCELLED,
-    }.get(result.state, EXIT_ERROR)
+    return _emit(result)
+
+
+def send_message_main(argv: list[str]) -> int:
+    """`harness send-message --to <run_id> --message <text>` (#78): resume the newest finished
+    run of `<run_id>`'s chain with a follow-up, wait for it in this process (no timeout,
+    never cancels) and print the new run as one JSON line. Same exit codes as `run-agent`;
+    on 4 stdout is empty and the message (naming the state / unknown id) is on stderr."""
+    p = _Parser(
+        prog="harness send-message",
+        description="Send a follow-up to a finished run and print the reply.",
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--to", required=True, help="run_id (a native agentId) to continue")
+    p.add_argument("--message", required=True, help="the follow-up prompt")
+    args = p.parse_args(argv)
+    try:
+        target = newest_in_chain(args.to)
+        started = resume_run(target, args.message)
+        result = harness().wait(started.run_id, timeout=None, poll_interval=1.0)
+    except (HarnessError, OSError) as exc:
+        print(f"harness send-message: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    return _emit(result, resumed_from=target)

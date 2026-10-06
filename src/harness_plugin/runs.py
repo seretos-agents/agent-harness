@@ -16,6 +16,7 @@ from lib_python_harness import (
     FileRunStore,
     Harness,
     HarnessError,
+    RunResult,
     discover,
     load_harness_config,
     resolve,
@@ -312,7 +313,7 @@ def launched_fields(run_id: str) -> dict[str, Any]:
     recorded argv -- the one path every answer about a run's launched values goes
     through (plan Approach), replacing the four call sites that used to pass their
     own extras. `effort_source` comes from the record itself (see
-    `remember_effort_source`) and degrades to `"unknown"` when the record predates
+    `stamp_record`) and degrades to `"unknown"` when the record predates
     this field or the run is gone -- never an error, since a still-valid poll/wait
     on an older run must keep working."""
     record = harness().store.get(run_id)
@@ -325,20 +326,56 @@ def launched_fields(run_id: str) -> dict[str, Any]:
     }
 
 
-def remember_effort_source(run_id: str, source: str) -> None:
-    """Persist `source` (one of `argument`/`agent_definition`/`parent_session`/
-    `none`) on `run_id`'s own record -- the only per-run carrier that already
-    crosses process boundaries (`FileRunStore` re-reads `record.json` from disk,
-    no in-process cache), so a later `harness_poll_run`/`harness_wait_run`, even
-    from a different process (e.g. `harness wait`), can answer where the launched
-    effort came from. Read-modify-put, called right after `start()`/
-    `start_resume()`; a no-op if the record is already gone."""
+def stamp_record(run_id: str, **fields: Any) -> None:
+    """Persist `fields` (e.g. `effort_source`: one of `argument`/`agent_definition`/
+    `parent_session`/`none`; `resumed_from`) on `run_id`'s own record -- the only per-run
+    carrier that already crosses process boundaries (`FileRunStore` re-reads `record.json`
+    from disk, no in-process cache), so a later `harness_poll_run`/`harness_wait_run`,
+    even from a different process (e.g. `harness wait`), can answer from it. One
+    read-modify-put, called right after `start()`/`start_resume()`; a no-op if the
+    record is already gone."""
     h = harness()
     record = h.store.get(run_id)
     if record is None:
         return
-    record["effort_source"] = source
+    record.update(fields)
     h.store.put(run_id, record)
+
+
+def newest_in_chain(run_id: str) -> str:
+    """The newest run of `run_id`'s resume chain (#78): from `run_id`, repeatedly step to
+    the newest-`created_at` record whose persisted `resumed_from` is the current id, until
+    none is left. Following the persisted link (not `session_id`) keeps this right when
+    `claude --resume` forks a new session. Raises HarnessError for an unknown id."""
+    store = harness().store
+    if store.get(run_id) is None:
+        raise HarnessError(f"unknown run_id: {run_id}")
+    current = run_id
+    seen = {current}
+    while True:
+        followers = [
+            r
+            for r in store.list()
+            if r.get("resumed_from") == current and r.get("run_id") not in seen
+        ]
+        if not followers:
+            return current
+        newest = max(followers, key=lambda r: r.get("created_at") or 0.0)
+        current = newest["run_id"]
+        seen.add(current)
+
+
+def resume_run(run_id: str, prompt: str) -> RunResult:
+    """Send a follow-up `prompt` to the finished run `run_id` and return the new RUNNING
+    run (shared by `harness_send_message` and `harness send-message`). The origin's
+    `effort_source` lives only on its own record and is not copied by the library, so it
+    is looked up and re-stamped here; `resumed_from` is stamped in the same write."""
+    if not prompt.strip():
+        raise HarnessError("prompt must not be empty")
+    origin_source = launched_fields(run_id)["effort_source"]
+    result = harness().start_resume(run_id, prompt)
+    stamp_record(result.run_id, effort_source=origin_source, resumed_from=run_id)
+    return result
 
 
 def claude_argv() -> list[str]:
@@ -509,5 +546,5 @@ def start_agent(
     spec.label = label
     spec.artifacts_dir = artifacts_root()
     result = harness().start(spec)
-    remember_effort_source(result.run_id, effort_source)
+    stamp_record(result.run_id, effort_source=effort_source)
     return result, used, source

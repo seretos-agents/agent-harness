@@ -37,6 +37,7 @@ import os
 import re
 import sys
 import time
+import uuid
 
 # Fixed name lists the init event announces, keyed to match `_INIT_NAME_FIELDS`'s
 # primary spelling (`mcp_servers`, `tools`, `skills`, `agents`) so a test can assert
@@ -83,6 +84,11 @@ def main() -> int:
     for flag in ("--session-id", "--resume"):
         if flag in argv:
             session_id = argv[argv.index(flag) + 1]
+    if os.environ.get("HARNESS_FAKE_FORK_ON_RESUME") and "--resume" in argv:
+        # #78: with HARNESS_FAKE_FORK_ON_RESUME set, a resumed run reports a FRESH session
+        # id (real `claude --resume` may fork), so a test can tell "resumed the newest
+        # run's session" from "resumed the origin's".
+        session_id = str(uuid.uuid4())
 
     prompt = sys.stdin.read()
     match = re.search(r"SLEEP:(\d+(?:\.\d+)?)", prompt)
