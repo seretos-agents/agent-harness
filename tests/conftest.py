@@ -212,6 +212,15 @@ def run_agent_cmd() -> list[str]:
 
 
 @pytest.fixture
+def send_message_cmd() -> list[str]:
+    """argv prefix that launches the `send-message` subcommand: a prebuilt binary when
+    HARNESS_BIN points at one, else `python -m harness_plugin`."""
+    binary = os.environ.get("HARNESS_BIN")
+    base = [binary] if binary else [sys.executable, "-m", "harness_plugin"]
+    return [*base, "send-message"]
+
+
+@pytest.fixture
 def shipped_agents_install(tmp_path) -> Path:
     """Like `plugin_agent_install`, but the `agent-harness@mk` install carries this
     repo's own shipped `agents/*.md` (general-purpose, Explore, Plan), so the native
