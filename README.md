@@ -103,9 +103,22 @@ None of the three pins a `model:` or `effort:`; a run inherits them from the par
 
 Colon-qualified plugin-agent dispatch is covered by a fake-CLI test in CI plus an opt-in live test (`tests/test_live_claude.py::test_live_start_plugin_agent_colon_qualified`), deselected by default. To run it, provision a real `CLAUDE_CONFIG_DIR` holding a `harness-live-fixture@<any>` plugin install with `agents/echo.md` (`model: haiku`, `tools: Read`), `settings.json` enabling that plugin, and real credentials; point `HARNESS_LIVE_PLUGIN_CONFIG_DIR` at it and run `python -m pytest -m live tests/test_live_claude.py`.
 
-## Native subagent dispatch is disabled
+## Native `Agent` calls run through the harness
 
-A `PreToolUse` hook denies Claude Code's built-in subagent tool (`Agent`, and its legacy alias `Task`) unconditionally, in every session the plugin is installed in — no opt-in flag. The denial names `harness_start_agent` and `harness_start_prompt` as the replacement: use one of those instead of the native tool. This applies inside a `harness_start_agent`-launched child too, since it loads the plugin (and this same hook) just like the parent session — a harness-launched agent cannot escape the restriction by spawning a native subagent of its own.
+In Claude Code >= 2.1.291 (Function Hooks early access) the plugin's hooks module (`hooks/agent_dispatch.ts`, registered under `modules` in `hooks/hooks.json`) answers every native `Agent` call (and its legacy alias `Task`): it runs the subagent through the harness with `harness run-agent`, waits for it synchronously and hands the child's answer back as the `Agent` result (`agentId` is the run id). Parallel `Agent` calls in one message run as parallel harness runs. If the run ends FAILED or CANCELLED, or the module cannot start it, the call returns an error carrying the state and text. The module never lets a native subagent run: the classic `PreToolUse` hook on `Agent|Task` stays as the fallback and denies the call (naming `harness_start_agent` / `harness_start_prompt`) if the module fails to load, e.g. on an older Claude Code.
+
+The child inherits the parent session's permission mode and effort from the session file the classic `harness hook` writes. That file is refreshed on every `UserPromptSubmit`, so a mode or effort change in the middle of a turn (for example leaving plan mode) reaches children only from the next prompt on. `subagent_type` `general-purpose`, `Explore` and `Plan` map to the shipped `agent-harness:<name>` agents; any other value is used as given. This applies inside a harness-launched child too. The MCP/Codex path (`harness_start_agent`) is unchanged.
+
+### `harness run-agent`
+
+`harness run-agent --subagent-type <name> --prompt <text> [--model <m>] [--description <label>]` starts the run, blocks until it ends and prints one JSON object shaped like `harness_poll_run`'s result. It has no timeout and never cancels the run.
+
+| exit | meaning |
+| --- | --- |
+| 0 | run COMPLETED |
+| 1 | run FAILED |
+| 3 | run CANCELLED (stopped from another process) |
+| 4 | error: unknown agent, no usable session context, invalid arguments (stdout empty, message on stderr) |
 
 ## MCP servers
 

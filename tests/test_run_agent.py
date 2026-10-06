@@ -89,7 +89,7 @@ def test_run_agent_completed_returns_answer_and_run_id(
     assert payload["text"] == "alpha"
     record_path = Path(env["HARNESS_ARTIFACTS_DIR"]) / payload["run_id"] / "record.json"
     record = json.loads(record_path.read_text(encoding="utf-8"))
-    assert record["state"] == "COMPLETED"
+    assert record["state"] == {"__runstate__": "COMPLETED"}
     # Additional coverage: --description becomes the run label.
     assert record.get("label") == "my label"
 

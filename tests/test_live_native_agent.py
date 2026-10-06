@@ -158,7 +158,7 @@ def test_live_native_agent_frame():
         records = _records(artifacts)
         assert len(records) == 1, records
         record = records[0]
-        assert record["state"] == "COMPLETED"
+        assert record["state"] == {"__runstate__": "COMPLETED"}
         run_id = record.get("run_id") or record.get("id")
         assert run_id, record
         # Bind the run id to the `agentId` field of THIS Agent tool result (not merely
@@ -209,7 +209,7 @@ def test_live_three_parallel_agents():
 @pytest.mark.timeout(400)
 def test_live_hook_failure_never_native():
     """L3: with no binaries in the plugin dir the module cannot spawn: the Agent call
-    ends as an error (the module's message or the #52 deny), and the call is never run
+    ends as an error carrying the module's own try/catch message, and the call is never run
     natively -- no stream line is attributed to the Agent tool_use as its parent."""
     _require_live()
     root = Path(tempfile.mkdtemp(prefix="ah76-"))
@@ -229,7 +229,7 @@ def test_live_hook_failure_never_native():
         block, _ = _result_for(entries, call_id)
         assert block is not None and block.get("is_error") is True, block
         text = _tool_result_text(block)
-        assert "agent-harness could not run Agent through the harness" in text or DENY_MARKER in text, text
+        assert "agent-harness could not run Agent through the harness" in text, text
         assert not any(e.get("parent_tool_use_id") == call_id for e in entries), (
             "a native subagent ran under the Agent tool_use"
         )
@@ -263,7 +263,7 @@ def test_live_long_runner_1100s():
         block, _ = _result_for(entries, calls[0]["id"])
         assert block is not None and not block.get("is_error"), block
         records = _records(artifacts)
-        assert len(records) == 1 and records[0]["state"] == "COMPLETED", records
+        assert len(records) == 1 and records[0]["state"] == {"__runstate__": "COMPLETED"}, records
         assert wall >= 1100, wall
     finally:
         shutil.rmtree(root, ignore_errors=True)

@@ -109,4 +109,4 @@ jobs:
           # committed POSIX dispatcher, not build output).
           $bin = if ($IsWindows) { "bin/harness.exe" } else { "bin/harness-linux" }
           $env:HARNESS_BIN = (Resolve-Path $bin).Path
-          python -m pytest tests/test_wait_run.py tests/test_launch_commands.py
+          python -m pytest tests/test_wait_run.py tests/test_launch_commands.py tests/test_run_agent.py
