@@ -9,12 +9,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import NoReturn
 
 from lib_python_harness import HarnessError, RunState
 
-from harness_plugin.runs import StartRefused, harness, run_to_dict, start_agent
+from harness_plugin.runs import (
+    LAUNCHED_AGENT_ENV,
+    LAUNCHED_SESSION_ENV,
+    StartRefused,
+    harness,
+    run_to_dict,
+    start_agent,
+)
 from harness_plugin.wait_run import (
     EXIT_CANCELLED,
     EXIT_COMPLETED,
@@ -32,7 +40,8 @@ exit codes:
   0  run COMPLETED
   1  run FAILED
   3  run CANCELLED (stopped from another process)
-  4  error: unknown agent, refused session context, invalid arguments
+  4  error: unknown agent, refused session context, caller may not spawn (canSpawn),
+     invalid arguments
 
 There is no timeout: the call blocks until the run ends and never cancels it.
 stdout is exactly one JSON object shaped like harness_poll_run's result."""
@@ -64,6 +73,15 @@ def main(argv: list[str]) -> int:
     agent = args.subagent_type
     if agent in _BUILTIN_AGENT_TYPES:
         agent = f"agent-harness:{agent}"
+    # Inside a harness child (#77): its own session file by exact id, never the parent's
+    # newest-file fallback (CLAUDE_PROJECT_DIR is inherited from the parent).
+    session_env = None
+    launched_session = os.environ.get(LAUNCHED_SESSION_ENV)
+    if launched_session:
+        session_env = {
+            k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"
+        }
+        session_env["CLAUDE_CODE_SESSION_ID"] = launched_session
     try:
         started, _used, _source = start_agent(
             agent,
@@ -73,6 +91,8 @@ def main(argv: list[str]) -> int:
             effort=None,
             label=args.description or None,
             prompt=args.prompt,
+            session_env=session_env,
+            caller=os.environ.get(LAUNCHED_AGENT_ENV) or None,
         )
         result = harness().wait(started.run_id, timeout=None, poll_interval=1.0)
     except (StartRefused, HarnessError, OSError) as exc:

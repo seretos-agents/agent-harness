@@ -326,6 +326,29 @@ def test_run_agent_child_can_spawn_false_refuses(
     assert not Path(env["HARNESS_FAKE_ARGV_LOG"]).exists()
 
 
+@pytest.mark.parametrize(
+    "yml",
+    ["agents:\n  demo: {}\n", "defaults:\n  model: sonnet\n"],
+    ids=["entry-without-canspawn", "defaults-only"],
+)
+def test_run_agent_child_can_spawn_unset_refuses(
+    tmp_path, project_dir, session_context, wait_run_env, run_agent_cmd, yml
+):
+    """lib-python-harness v0.0.11 apply_config: any entry/defaults without canSpawn: true."""
+    child_project = _child_setup(tmp_path, project_dir, session_context)
+    cfg = child_project / ".seretos"
+    cfg.mkdir()
+    (cfg / "harness.yml").write_text(yml, encoding="utf-8")
+    env = _child_env(wait_run_env, "demo", project=project_dir)
+    code, out, err = _run_child(
+        run_agent_cmd, env, child_project, "--subagent-type", "effort-agent",
+        "--prompt", "ECHO:alpha",
+    )
+    assert code == 4, (out, err)
+    assert "canSpawn" in err
+    assert not Path(env["HARNESS_FAKE_ARGV_LOG"]).exists()
+
+
 def test_run_agent_child_can_spawn_true_completes(
     tmp_path, project_dir, session_context, wait_run_env, run_agent_cmd
 ):

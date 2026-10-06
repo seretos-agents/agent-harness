@@ -9,7 +9,7 @@ import json
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from lib_python_harness import (
     ClaudeCliProvider,
@@ -35,16 +35,25 @@ _HARNESS: Harness | None = None
 # so a hook running inside that child -- e.g. its own `Stop` hook -- can tell which
 # agent it is running as. See README.md's "Agent identity inside a run" section.
 LAUNCHED_AGENT_ENV = "HARNESS_LAUNCHED_AGENT"
+# Public contract name (#77): the child's own session id (its `--session-id`, the name of
+# its session file). The lib scrubs CLAUDE_CODE_SESSION_ID from a child's env, so a native
+# `Agent` call inside the child (-> `harness run-agent`) finds its own context by this.
+LAUNCHED_SESSION_ENV = "HARNESS_LAUNCHED_SESSION_ID"
 
 
-def _with_identity(env: dict[str, str], name: str | None) -> dict[str, str]:
-    """`env` (a `LaunchPlan.env`, never mutated in place) with `LAUNCHED_AGENT_ENV`
+def _with_identity(
+    env: dict[str, str], name: str | None, session_id: str | None = None
+) -> dict[str, str]:
+    """`env` (a `LaunchPlan.env`, never mutated in place) with `LAUNCHED_SESSION_ENV`
+    set to `session_id` (when given) and `LAUNCHED_AGENT_ENV`
     set to `name` when truthy, or popped otherwise. The pop branch matters even
     though `_scrub_env()` only ever copies the *current* process's own env: a
     server running inside an agent session would otherwise leak its own identity
     into a CLEAN `harness_start_prompt` child, or a resumed `harness_send_message`
     follow-up on a prompt-origin run would inherit a stale value."""
     env = dict(env)
+    if session_id:
+        env[LAUNCHED_SESSION_ENV] = session_id
     if name:
         env[LAUNCHED_AGENT_ENV] = name
     else:
@@ -81,12 +90,17 @@ class _AgentIdentityProvider(ClaudeCliProvider):
 
     def build_launch_plan(self, spec, **kwargs):
         plan = super().build_launch_plan(spec, **kwargs)
-        return dataclasses.replace(plan, env=_with_identity(plan.env, spec.agent_name))
+        return dataclasses.replace(
+            plan,
+            env=_with_identity(plan.env, spec.agent_name, kwargs.get("session_id")),
+        )
 
     def build_resume_plan(self, *, provider_argv, **kwargs):
         plan = super().build_resume_plan(provider_argv=provider_argv, **kwargs)
         name = _recover_launched_agent_name(provider_argv)
-        return dataclasses.replace(plan, env=_with_identity(plan.env, name))
+        return dataclasses.replace(
+            plan, env=_with_identity(plan.env, name, kwargs.get("session_id"))
+        )
 
 
 # Init-event key(s) each announced category may be spelled under, primary spelling
@@ -393,6 +407,24 @@ class StartRefused(Exception):
     mcp-free, the MCP wrapper re-raises it as ToolError with the same text."""
 
 
+def _require_can_spawn(config: Any, caller: str) -> None:
+    """The lib's `apply_config` canSpawn rule (lib-python-harness v0.0.11, config/apply.py),
+    mirrored: no config, or neither an `agents:` entry for the caller nor any `defaults:`
+    -> allowed; otherwise allowed iff the caller's entry sets `canSpawn: true`. Keep in step
+    with the pinned lib version -- the module path has no MCP server whose presence could
+    carry the grant."""
+    if config is None:
+        return
+    entry = config.agents.get(caller)
+    if entry is None and not config.defaults.model_fields_set:
+        return
+    if entry is None or not entry.canSpawn:
+        raise StartRefused(
+            f"agent {caller!r} may not start subagents: .seretos/harness.yml does not "
+            "set canSpawn: true for it"
+        )
+
+
 def start_agent(
     agent: str,
     *,
@@ -402,13 +434,19 @@ def start_agent(
     effort: str | None,
     label: str | None,
     prompt: str | None,
+    session_env: Mapping[str, str] | None = None,
+    caller: str | None = None,
 ) -> tuple[Any, str, str]:
     """Start a discovered subagent (by qualified name) inheriting the parent session's
     context. Returns (run result, used cwd, context source). Shared by
-    `harness_start_agent` (MCP) and `harness run-agent`."""
+    `harness_start_agent` (MCP) and `harness run-agent`.
+
+    `session_env` (run-agent inside a harness child, #77) is the env the session context is
+    looked up in instead of `os.environ`. `caller` (the qualified name of the harness agent
+    making this call) enables the `canSpawn` gate; the MCP path passes neither."""
     if prompt is not None and not prompt.strip():
         raise HarnessError("prompt must not be empty")
-    data, source = load_session_context()
+    data, source = load_session_context(session_env)
     if data is None:
         raise StartRefused(
             "cannot determine the parent session's context: CLAUDE_CODE_SESSION_ID is not "
@@ -429,12 +467,14 @@ def start_agent(
     ctx = build_host_context(
         data, used, model=model, permission_mode=permission_mode, effort=effort
     )
+    config = load_harness_config(used)
+    if caller:
+        _require_can_spawn(config, caller)
     definitions = discover(ctx)
     definition = definitions.get(agent)
     if definition is None:
         known = ", ".join(sorted(definitions)) or "(none)"
         raise StartRefused(f"unknown agent {agent!r}; known agents: {known}")
-    config = load_harness_config(used)
     spec = resolve(definition, ctx, config=config, task=prompt)
     if spec.strict_mcp is None:
         # No config-driven mcpServers set for this agent (apply_config never ran,
