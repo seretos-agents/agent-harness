@@ -5,9 +5,9 @@ stream-json events `lib_python_harness` parses (a terminal `result` event
 carrying `result` and `session_id`). A prompt containing `SLEEP:<seconds>`
 keeps the process alive first, so one fixture yields both a fast run and a
 still-RUNNING run. With HARNESS_FAKE_ARGV_LOG set, each real invocation appends
-one JSON line {"argv": [...], "cwd": ..., "launched_agent": ...} so tests can assert
+one JSON line {"argv": [...], "cwd": ..., "launched_agent": ..., "launched_session": ...} so tests can assert
 which flags and working directory the CLI actually received, and (#51) whatever value
-HARNESS_LAUNCHED_AGENT had in the child's own environment (None if unset). A prompt containing `NO_RESULT`
+HARNESS_LAUNCHED_AGENT (and, #77, HARNESS_LAUNCHED_SESSION_ID) had in the child's own environment (None if unset). A prompt containing `NO_RESULT`
 exits after the init event without any `result` event (a FAILED run).
 A prompt containing `TICK:<count>:<interval>` emits `count` assistant events
 `interval` seconds apart (flushed) before the terminal `result` event, so a
@@ -73,6 +73,7 @@ def main() -> int:
                         "argv": argv,
                         "cwd": os.getcwd(),
                         "launched_agent": os.environ.get("HARNESS_LAUNCHED_AGENT"),
+                        "launched_session": os.environ.get("HARNESS_LAUNCHED_SESSION_ID"),
                     }
                 )
                 + "\n"

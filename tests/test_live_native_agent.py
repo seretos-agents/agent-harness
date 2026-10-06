@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 import pytest
+from lib_python_harness import FileRunStore, Harness
 from test_live_claude import _real_credentials_path, _tool_result_text
 
 pytestmark = pytest.mark.live
@@ -265,5 +266,70 @@ def test_live_long_runner_1100s():
         records = _records(artifacts)
         assert len(records) == 1 and records[0]["state"] == {"__runstate__": "COMPLETED"}, records
         assert wall >= 1100, wall
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.mark.timeout(900)
+def test_live_grandchild_chain():
+    """L5 (#77): a harness child (started by the parent's native Agent call) makes its own
+    native Agent call; the grandchild's answer travels grandchild -> child -> parent.
+
+    The grandchild's answer is its own harness-generated `--session-id` (via
+    HARNESS_LAUNCHED_SESSION_ID): it is in no prompt, and a child echoing its own env
+    would yield a different id. Runs in `bypassPermissions` only, and loads the plugin
+    with `--plugin-dir` (HARNESS_CLAUDE_ARGV), so this does not prove the installed-plugin
+    premise nor other permission modes."""
+    _require_live()
+    root = Path(tempfile.mkdtemp(prefix="ah77-"))
+    try:
+        plugin = _build_plugin_dir(root)
+        env, project, artifacts = _session_env(root)
+        env["HARNESS_CLAUDE_ARGV"] = json.dumps(["claude", "--plugin-dir", str(plugin)])
+        proc, _ = _claude(
+            plugin, project, env,
+            "Make exactly one Agent tool call (subagent_type general-purpose) with this prompt: "
+            "'Make exactly one Agent tool call (subagent_type general-purpose) with the prompt "
+            "\"Run the Bash command `echo $HARNESS_LAUNCHED_SESSION_ID` and reply with exactly "
+            "its output\", then reply with exactly the answer it returns.' "
+            "Then reply with exactly the answer that call returns. Do nothing else.",
+            timeout=860,
+        )
+        entries = _stream(proc)
+        calls = _agent_calls(entries)
+        assert len(calls) == 1, f"expected exactly one parent Agent call:\n{proc.stdout!r}\n{proc.stderr!r}"
+        block, _ = _result_for(entries, calls[0]["id"])
+        assert block is not None and not block.get("is_error"), block
+        parent_text = _tool_result_text(block)
+        assert DENY_MARKER not in parent_text, f"the #52 deny text came back: {parent_text!r}"
+
+        records = _records(artifacts)
+        assert len(records) == 2, records
+        assert all(r["state"] == {"__runstate__": "COMPLETED"} for r in records), records
+        ids = [_flag(r["argv"], "--session-id") for r in records]
+        assert all(ids) and ids[0] != ids[1], ids
+        grand = [r for r, i in zip(records, ids) if i in parent_text]
+        assert len(grand) == 1, f"the grandchild's session id is not in the parent's tool_result {parent_text!r}: {ids}"
+        grand = grand[0]
+        child = next(r for r in records if r is not grand)
+        gid = _flag(grand["argv"], "--session-id")
+        def _without_session_id(argv):
+            argv = list(map(str, argv))
+            out, skip = [], False
+            for a in argv:
+                if skip:
+                    skip = False
+                elif a == "--session-id":
+                    skip = True
+                else:
+                    out.append(a)
+            return " ".join(out)
+
+        assert not any(gid in _without_session_id(r["argv"]) for r in records), "the id leaked into a prompt/argv"
+        child_text = Harness(store=FileRunStore(artifacts)).wait(
+            child.get("run_id") or child.get("id"), timeout=30, poll_interval=0.5
+        ).text
+        assert gid in child_text and DENY_MARKER not in child_text, child_text
+        assert child["created_at"] < grand["created_at"], (child["created_at"], grand["created_at"])
     finally:
         shutil.rmtree(root, ignore_errors=True)
