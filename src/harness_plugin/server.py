@@ -29,9 +29,9 @@ from harness_plugin.runs import (
     artifacts_root,
     harness,
     inspect_run,
-    launched_fields,
-    remember_effort_source,
+    resume_run,
     run_to_dict,
+    stamp_record,
     start_agent,
     StartRefused,
     summary_to_dict,
@@ -242,7 +242,7 @@ def harness_start_prompt(
         artifacts_dir=artifacts_root(),
     )
     result = harness().start(spec)
-    remember_effort_source(result.run_id, "argument" if effort else "none")
+    stamp_record(result.run_id, effort_source="argument" if effort else "none")
     return run_to_dict(result)
 
 
@@ -279,16 +279,7 @@ def harness_send_message(run_id: str, prompt: str) -> dict[str, Any]:
     state RUNNING. The origin run's isolation is preserved: the follow-up runs with the same
     clean/agent flags and cwd as the origin. Afterwards use harness_wait_run or
     harness_poll_run on the new run_id to get the reply."""
-    if not prompt.strip():
-        raise HarnessError("prompt must not be empty")
-    # The origin's argv (and thus its launched `effort` value) is replayed
-    # verbatim by start_resume() (harness.py's provider_argv replay), so
-    # launched_fields() answers `effort` for the new run with no extra plumbing
-    # -- but `effort_source` lives only on the origin's own record and is not
-    # copied by the library, so it must be looked up and re-stamped explicitly.
-    origin_source = launched_fields(run_id)["effort_source"]
-    result = harness().start_resume(run_id, prompt)
-    remember_effort_source(result.run_id, origin_source)
+    result = resume_run(run_id, prompt)
     return run_to_dict(result, resumed_from=run_id)
 
 

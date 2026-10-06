@@ -16,6 +16,11 @@ if __name__ == "__main__":
         from harness_plugin.run_agent import main as run_agent_main
 
         sys.exit(run_agent_main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "send-message":
+        # Also before mcp: blocking resume behind native `SendMessage` (#78).
+        from harness_plugin.run_agent import send_message_main
+
+        sys.exit(send_message_main(sys.argv[2:]))
     from harness_plugin.server import main
 
     main()

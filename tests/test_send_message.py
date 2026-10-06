@@ -2,6 +2,7 @@
 `SendMessage` to a harness `agentId` (= run_id). Modelled on test_run_agent.py; the hooks
 module's routing is proven only by the `live` tests (test_live_native_agent.py)."""
 import json
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -100,11 +101,19 @@ def test_send_message_continues_newest_in_chain(
     assert _resume_flags(env)[-1] == f1_session
     assert _records_by_id(env)[f2].get("resumed_from") == f1
 
-    # Additional coverage: addressing F1 by its own id reaches the newest (F2) session.
+    # A third send addressed to the ORIGIN must walk two links (origin -> F1 -> F2).
     f2_session = _records_by_id(env)[f2]["session_id"]
-    code, out, err = _send(send_message_cmd, env, f1, "ECHO:three")
+    code, out, err = _send(send_message_cmd, env, origin, "ECHO:three")
     assert code == 0, (out, err)
+    f3 = _one_json(out)["run_id"]
     assert _resume_flags(env)[-1] == f2_session
+    assert _records_by_id(env)[f3].get("resumed_from") == f2
+
+    # Additional coverage: addressing F1 (mid-chain) reaches the newest (F3) session.
+    f3_session = _records_by_id(env)[f3]["session_id"]
+    code, out, err = _send(send_message_cmd, env, f1, "ECHO:four")
+    assert code == 0, (out, err)
+    assert _resume_flags(env)[-1] == f3_session
 
 
 def test_send_message_chains_do_not_cross(
@@ -187,3 +196,20 @@ def test_send_message_replays_origin_isolation(
     assert _flag(second["argv"], "--model") == "sonnet"
     assert second["cwd"] == first["cwd"]
     assert second["launched_agent"] == first["launched_agent"] == "demo"
+
+
+def test_send_message_replays_origin_cwd_from_other_directory(
+    session_context, wait_run_env, run_agent_cmd, send_message_cmd, tmp_path
+):
+    env = _env(wait_run_env)
+    origin = _origin(run_agent_cmd, env)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    proc = subprocess.run(
+        [*send_message_cmd, "--to", origin, "--message", "ECHO:beta"],
+        capture_output=True, text=True, env=env, cwd=elsewhere, timeout=60,
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    first, second = _argv_entries(env)[-2:]
+    assert Path(second["cwd"]).resolve() == Path(first["cwd"]).resolve()
+    assert Path(second["cwd"]).resolve() != elsewhere.resolve()
