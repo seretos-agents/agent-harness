@@ -221,6 +221,21 @@ def test_hook_commands_via_bash_write_session_file(plugin_root, bash_exe, tmp_pa
     assert "acceptEdits" in session_file.read_text(encoding="utf-8")
 
 
+def test_user_prompt_submit_hook_writes_session_file(plugin_root, bash_exe, tmp_path):
+    """#76 R7: once a native `Agent` call is answered by the hooks module, the
+    `Agent|Task` PreToolUse writer never fires, so a classic `UserPromptSubmit`
+    hook must refresh the parent's permission_mode before any `Agent` call of a
+    turn. hooks.json's UserPromptSubmit command, read verbatim, runs the real
+    binary under bash and writes the session file.
+
+    Expected RED reason: hooks.json has no UserPromptSubmit group."""
+    commands = [c for event, c in _HOOK_ENTRIES if event == "UserPromptSubmit"]
+    assert commands, "hooks.json carries no UserPromptSubmit hook"
+    test_hook_commands_via_bash_write_session_file(
+        plugin_root, bash_exe, tmp_path, "UserPromptSubmit", commands[0]
+    )
+
+
 # test_hook_commands_share_one_launch_path removed (test-critic round 1,
 # tautology::F1): it only asserted hooks.json's static JSON shape (two
 # entries, identical command strings), which the plan declares unchanged by

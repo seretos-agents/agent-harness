@@ -11,6 +11,19 @@ FAKE_CLAUDE = Path(__file__).parent / "fixtures" / "fake_claude.py"
 
 SESSION_ID = "test-session"
 
+REPO = Path(__file__).resolve().parents[1]
+
+
+def copy_classic_hooks(dest: Path) -> None:
+    """Copy this repo's hooks/hooks.json to `dest` with the `modules` key stripped, so a
+    live fixture exercising the classic command hooks (#52 deny, Stop wait) is not
+    short-circuited by the native-Agent hooks module (#76)."""
+    data = json.loads((REPO / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    data.pop("modules", None)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(json.dumps(data, indent=2) + "\n")
+
 
 def plant_session_file(plugin_data: Path, session_id: str, **fields) -> Path:
     """Write what the hook would: <CLAUDE_PLUGIN_DATA>/sessions/<session_id>.json."""
@@ -187,6 +200,45 @@ def wait_run_env(tmp_path) -> dict[str, str]:
     HARNESS_CLAUDE_ARGV the `server_params` server uses, layered over os.environ
     so Windows keeps SYSTEMROOT/PATH."""
     return {**os.environ, **_base_env(tmp_path)}
+
+
+@pytest.fixture
+def run_agent_cmd() -> list[str]:
+    """argv prefix that launches the `run-agent` subcommand: a prebuilt binary when
+    HARNESS_BIN points at one, else `python -m harness_plugin`."""
+    binary = os.environ.get("HARNESS_BIN")
+    base = [binary] if binary else [sys.executable, "-m", "harness_plugin"]
+    return [*base, "run-agent"]
+
+
+@pytest.fixture
+def shipped_agents_install(tmp_path) -> Path:
+    """Like `plugin_agent_install`, but the `agent-harness@mk` install carries this
+    repo's own shipped `agents/*.md` (general-purpose, Explore, Plan), so the native
+    built-in type names map onto the definitions the plugin really ships."""
+    repo = Path(__file__).resolve().parents[1]
+    install_dir = tmp_path / "plugins" / "agent-harness"
+    agents = install_dir / "agents"
+    agents.mkdir(parents=True)
+    for md in (repo / "agents").glob("*.md"):
+        (agents / md.name).write_text(md.read_text(encoding="utf-8"), encoding="utf-8")
+    config = tmp_path / "claude-config"
+    (config / "plugins").mkdir(parents=True, exist_ok=True)
+    (config / "plugins" / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {
+                    "agent-harness@mk": [{"scope": "user", "installPath": str(install_dir)}]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (config / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"agent-harness@mk": True}}), encoding="utf-8"
+    )
+    return install_dir
 
 
 @pytest.fixture
