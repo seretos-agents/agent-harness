@@ -11,9 +11,22 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from lib_python_harness import ClaudeCliProvider, FileRunStore, Harness, HarnessError
+from lib_python_harness import (
+    ClaudeCliProvider,
+    FileRunStore,
+    Harness,
+    HarnessError,
+    discover,
+    load_harness_config,
+    resolve,
+)
 
-from harness_plugin.host_context import artifacts_root  # noqa: F401 -- re-exported (#62): server.py/wait_run.py import it from here
+from harness_plugin.host_context import (
+    artifacts_root,  # noqa: F401 -- re-exported (#62): server.py/wait_run.py import it from here
+    build_host_context,
+    load_session_context,
+    sessions_dir,
+)
 
 _HARNESS: Harness | None = None
 
@@ -372,3 +385,89 @@ def summary_to_dict(summary: Any) -> dict[str, Any]:
         "created_at": summary.created_at,
         "label": summary.label,
     }
+
+
+class StartRefused(Exception):
+    """`start_agent` refused to start (unconfirmed context, unknown agent, no model).
+    Kept apart from HarnessError so each caller words it its own way; runs.py stays
+    mcp-free, the MCP wrapper re-raises it as ToolError with the same text."""
+
+
+def start_agent(
+    agent: str,
+    *,
+    cwd: str | None,
+    model: str | None,
+    permission_mode: str | None,
+    effort: str | None,
+    label: str | None,
+    prompt: str | None,
+) -> tuple[Any, str, str]:
+    """Start a discovered subagent (by qualified name) inheriting the parent session's
+    context. Returns (run result, used cwd, context source). Shared by
+    `harness_start_agent` (MCP) and `harness run-agent`."""
+    if prompt is not None and not prompt.strip():
+        raise HarnessError("prompt must not be empty")
+    data, source = load_session_context()
+    if data is None:
+        raise StartRefused(
+            "cannot determine the parent session's context: CLAUDE_CODE_SESSION_ID is not "
+            "set or no matching session file exists in the sessions dir "
+            f"({sessions_dir()}); refusing to start a child on unconfirmed rights"
+        )
+    # Refusal rules: no session file at all (above) refuses unconditionally, even with an
+    # explicit permission_mode. A SessionStart-only snapshot refuses only when the EFFECTIVE
+    # mode (explicit argument, else file value) is missing. No cwd => cannot resolve the agent.
+    if not (permission_mode or data.get("permission_mode")):
+        raise StartRefused(
+            "the parent session's context carries no permission_mode yet (only a "
+            "SessionStart snapshot exists); refusing to start a child on unconfirmed rights"
+        )
+    used = cwd or data.get("cwd") or data.get("project_dir")
+    if not used:
+        raise StartRefused("the parent session's context carries no cwd; pass `cwd`")
+    ctx = build_host_context(
+        data, used, model=model, permission_mode=permission_mode, effort=effort
+    )
+    definitions = discover(ctx)
+    definition = definitions.get(agent)
+    if definition is None:
+        known = ", ".join(sorted(definitions)) or "(none)"
+        raise StartRefused(f"unknown agent {agent!r}; known agents: {known}")
+    config = load_harness_config(used)
+    spec = resolve(definition, ctx, config=config, task=prompt)
+    if spec.strict_mcp is None:
+        # No config-driven mcpServers set for this agent (apply_config never ran,
+        # or ran but this agent had no entry/defaults to apply): the parent's
+        # rebuilt set still has to reach the child explicitly (#38), since a
+        # non-strict launch with no --mcp-config gets no first-turn connect
+        # deadline (plan P2). A config-driven spec (strict_mcp is not None) is
+        # left exactly as apply_config produced it -- merging here would undo
+        # its removals and re-add servers it deliberately dropped.
+        merged = {**(ctx.mcp_servers or {}), **(spec.mcp_servers or {})}
+        spec.mcp_servers = merged or None
+    if model:
+        spec.model = model
+    if spec.model is None:
+        raise StartRefused(
+            f"no model for agent {agent!r}: pass `model` or set `model:` in its definition"
+        )
+    # Mirrors resolve()'s own real precedence (`effort = definition.effort or
+    # host_context.effort`, plan Approach) rather than assuming one: a definition's
+    # own `effort:` always wins (pre-existing library behaviour, reported truthfully
+    # here, not fixed); otherwise the explicit argument; otherwise the parent
+    # session's snapshot; otherwise nothing supplied one at all.
+    if definition.effort:
+        effort_source = "agent_definition"
+    elif effort:
+        effort_source = "argument"
+    elif data.get("effort"):
+        effort_source = "parent_session"
+    else:
+        effort_source = "none"
+    spec.cwd = used
+    spec.label = label
+    spec.artifacts_dir = artifacts_root()
+    result = harness().start(spec)
+    remember_effort_source(result.run_id, effort_source)
+    return result, used, source

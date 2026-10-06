@@ -336,6 +336,12 @@ def test_release_staging_ships_mcp_json(tmp_path):
     assert modes.get("bin/harness") == 0o755, modes
     assert modes.get("bin/harness-linux") == 0o755, modes
 
+    # #76 R8: the hooks module that answers native `Agent` calls ships in the
+    # release tree, byte-identical to the repo file (registration is proven by live L1).
+    staged_module = stage / "hooks" / "agent_dispatch.ts"
+    assert staged_module.is_file(), "stage/hooks/agent_dispatch.ts missing"
+    assert staged_module.read_bytes() == (REPO / "hooks" / "agent_dispatch.ts").read_bytes()
+
 
 # --- R4: Claude resolution ignores the new root .mcp.json -------------------
 

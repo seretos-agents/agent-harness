@@ -218,6 +218,7 @@ jobs:
           # hooks/ registers the session-context hook (plugin.json "hooks" key).
           cp -a stamped/hooks "$STAGE/"
           test -f "$STAGE/hooks/hooks.json"
+          test -f "$STAGE/hooks/agent_dispatch.ts"
           # agents/ ships the plugin's standard agents (discovered by lib-python-harness
           # as <plugin>:<name>). Hard-fail the release rather than silently skipping,
           # unlike the [ -d ... ] && cp || true pattern used for optional dirs above.

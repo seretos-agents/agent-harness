@@ -12,7 +12,7 @@ from pathlib import Path
 
 import anyio
 import pytest
-from conftest import SESSION_ID
+from conftest import SESSION_ID, copy_classic_hooks
 from test_mcp_tools import TERMINAL, _call, _poll_until_terminal, _run, _session
 
 pytestmark = pytest.mark.live
@@ -1028,7 +1028,7 @@ def test_live_native_subagent_dispatch_denied():
     marketplace_dir = tmp_path / "marketplace"
     fixture_dir = marketplace_dir / "harness-deny-fixture"
     (fixture_dir / "hooks").mkdir(parents=True)
-    shutil.copy2(REPO / "hooks" / "hooks.json", fixture_dir / "hooks" / "hooks.json")
+    copy_classic_hooks(fixture_dir / "hooks" / "hooks.json")
 
     bin_dir = fixture_dir / "bin"
     bin_dir.mkdir(parents=True)
@@ -1178,7 +1178,7 @@ def test_live_stop_hook_tracks_started_run():
     marketplace_dir = tmp_path / "marketplace"
     fixture_dir = marketplace_dir / "harness-stop-fixture"
     (fixture_dir / "hooks").mkdir(parents=True)
-    shutil.copy2(REPO / "hooks" / "hooks.json", fixture_dir / "hooks" / "hooks.json")
+    copy_classic_hooks(fixture_dir / "hooks" / "hooks.json")
 
     bin_dir = fixture_dir / "bin"
     bin_dir.mkdir(parents=True)

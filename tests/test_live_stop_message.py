@@ -31,6 +31,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import copy_classic_hooks
 from test_live_claude import REPO, _real_credentials_path, _tool_result_text, _write_json
 
 pytestmark = pytest.mark.live
@@ -97,7 +98,7 @@ def _provision_stop_message_fixture(tmp_path: Path) -> tuple[Path, Path, Path, d
     marketplace_dir = tmp_path / "marketplace"
     fixture_dir = marketplace_dir / "harness-stop-message-fixture"
     (fixture_dir / "hooks").mkdir(parents=True)
-    shutil.copy2(REPO / "hooks" / "hooks.json", fixture_dir / "hooks" / "hooks.json")
+    copy_classic_hooks(fixture_dir / "hooks" / "hooks.json")
 
     bin_dir = fixture_dir / "bin"
     bin_dir.mkdir(parents=True)
