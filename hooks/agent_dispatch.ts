@@ -38,8 +38,7 @@ async function runHarness($: { process: { spawn: (...a: any[]) => Promise<unknow
   const stderr = (done.stderr ?? '').trim()
 
   if (code === 0 || code === 1 || code === 3) {
-    const run = JSON.parse(stdout.split('
-').filter(line => line.trim() !== '').pop() ?? '{}') as Record<string, unknown>
+    const run = JSON.parse(stdout.split('\n').filter(line => line.trim() !== '').pop() ?? '{}') as Record<string, unknown>
     const text = typeof run.text === 'string' ? run.text : ''
 
     if (code !== 0) {

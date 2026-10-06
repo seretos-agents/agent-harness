@@ -213,3 +213,18 @@ def test_send_message_replays_origin_cwd_from_other_directory(
     first, second = _argv_entries(env)[-2:]
     assert Path(second["cwd"]).resolve() == Path(first["cwd"]).resolve()
     assert Path(second["cwd"]).resolve() != elsewhere.resolve()
+
+
+def test_agent_dispatch_ts_has_no_raw_newline_in_single_quoted_string():
+    """Guard: the hooks module is only exercised by `live` tests, so a stray raw newline
+    inside a '...' literal (instead of the two-character escape) would go unnoticed."""
+    src = Path(__file__).resolve().parent.parent / "hooks" / "agent_dispatch.ts"
+    for number, line in enumerate(src.read_text(encoding="utf-8").splitlines(), 1):
+        code = line.strip()
+        if code.startswith(("*", "/*", "//")) or "`" in code:
+            continue
+        # a single-quoted literal that is left open at the end of the line
+        quotes = len(code.replace("\'", "").replace('"', "")) - len(
+            code.replace("\'", "").replace('"', "").replace("'", "")
+        )
+        assert quotes % 2 == 0, f"{src.name}:{number}: unterminated single-quoted string: {line!r}"
