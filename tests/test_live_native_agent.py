@@ -7,6 +7,7 @@ is proven here only: the PR suite proves `run-agent` offline (test_run_agent.py)
 Minimum Claude Code: 2.1.291 (Function Hooks early access)."""
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -159,7 +160,16 @@ def test_live_native_agent_frame():
         record = records[0]
         assert record["state"] == "COMPLETED"
         run_id = record.get("run_id") or record.get("id")
-        assert run_id and run_id in json.dumps(entry), "agentId (the run id) missing from the result frame"
+        assert run_id, record
+        # Bind the run id to the `agentId` field of THIS Agent tool result (not merely
+        # "appears somewhere in the entry"): the structured result's agentId, or the
+        # hand-back frame text's `agentId: <id>` line.
+        structured = entry.get("tool_use_result")
+        structured_id = structured.get("agentId") if isinstance(structured, dict) else None
+        frame_ids = re.findall(r"agentId\W{1,4}([A-Za-z0-9_-]+)", text)
+        assert str(run_id) == structured_id or str(run_id) in frame_ids, (
+            f"agentId != run id {run_id!r}: structured={structured_id!r} frame={frame_ids!r}\n{text!r}"
+        )
         assert _flag(record["argv"], "--permission-mode") == "bypassPermissions"
         assert _flag(record["argv"], "--effort") == "medium"
     finally:
