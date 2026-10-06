@@ -313,7 +313,19 @@ def test_live_grandchild_chain():
         grand = grand[0]
         child = next(r for r in records if r is not grand)
         gid = _flag(grand["argv"], "--session-id")
-        assert not any(gid in " ".join(map(str, r["argv"])) for r in records), "the id leaked into a prompt/argv"
+        def _without_session_id(argv):
+            argv = list(map(str, argv))
+            out, skip = [], False
+            for a in argv:
+                if skip:
+                    skip = False
+                elif a == "--session-id":
+                    skip = True
+                else:
+                    out.append(a)
+            return " ".join(out)
+
+        assert not any(gid in _without_session_id(r["argv"]) for r in records), "the id leaked into a prompt/argv"
         child_text = Harness(store=FileRunStore(artifacts)).wait(
             child.get("run_id") or child.get("id"), timeout=30, poll_interval=0.5
         ).text
