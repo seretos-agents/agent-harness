@@ -16,6 +16,8 @@ A prompt containing `TOOL:<name>` emits one assistant `tool_use` event for that 
 after the init event (before any SLEEP), so a still-RUNNING run's last activity is that tool.
 A prompt containing `ECHO:<word>` is answered with `<word>` instead of `OK`. The session
 id is taken from `--session-id <id>` or, for a resumed run, `--resume <id>`.
+A prompt containing `USAGE` reports a known usage on the terminal `result` event
+(KNOWN_USAGE below) instead of `{}`, so a test can assert token arithmetic exactly (#82).
 A prompt containing `NO_INIT_NAMES` suppresses `INIT_ANNOUNCEMENTS` from the init event
 (a bare `{"type": "system", "subtype": "init", ...}`), so a test can exercise
 `harness_inspect_run`'s argv-derived `requested.*` fallback independently of what the
@@ -47,6 +49,15 @@ INIT_ANNOUNCEMENTS: dict[str, list[str]] = {
     "tools": ["Read", "Bash", "Write"],
     "skills": ["skill-one", "skill-two", "skill-three"],
     "agents": ["agent-x", "agent-y"],
+}
+
+# Usage the terminal `result` event carries when the prompt contains USAGE_MARKER.
+USAGE_MARKER = "USAGE"
+KNOWN_USAGE = {
+    "input_tokens": 11,
+    "output_tokens": 22,
+    "cache_creation_input_tokens": 330,
+    "cache_read_input_tokens": None,
 }
 
 # Marker checked against the prompt (stdin) to suppress INIT_ANNOUNCEMENTS above.
@@ -165,7 +176,7 @@ def main() -> int:
                 "result": answer,
                 "session_id": session_id,
                 "total_cost_usd": 0.0,
-                "usage": {},
+                "usage": KNOWN_USAGE if USAGE_MARKER in prompt else {},
             }
         ),
         flush=True,

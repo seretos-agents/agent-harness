@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 from conftest import FAKE_CLAUDE, REPO
 from lib_python_harness import FileRunStore, Harness
-from test_run_agent import _env, _one_json, _only_run_id
+from test_run_agent import _env, _one_json, _only_run_id, _stored_result
 from test_send_message import _origin
 
 DRIVER = Path(__file__).parent / "agent_dispatch_driver.mjs"
@@ -139,6 +139,22 @@ def test_agent_completed_matches_native_shape(session_context, wait_run_env, run
     assert r["totalDurationMs"] >= 0 and r["totalTokens"] >= 0
 
 
+def test_agent_totals_are_computed_from_the_run_record(session_context, wait_run_env, run_agent_cmd, module_mts):
+    env = _env(wait_run_env)
+    ans = _call(module_mts, "Agent", _agent_event("ECHO:alpha SLEEP:1 USAGE"), env, _prefix(run_agent_cmd))
+    _assert_agent_output(ans)
+    r = ans["result"]
+    stored = _stored_result(env, r["agentId"])
+    # Exact values from the fake claude's KNOWN_USAGE: null (cache_read) counts as 0.
+    assert r["usage"]["input_tokens"] == 11 and r["usage"]["output_tokens"] == 22
+    assert r["usage"]["cache_creation_input_tokens"] == 330
+    assert r["usage"]["cache_read_input_tokens"] is None
+    assert r["totalTokens"] == 11 + 22 + 330
+    assert r["totalDurationMs"] == round(stored.duration_s * 1000)
+    assert r["totalDurationMs"] >= 1000
+    assert r["totalToolUseCount"] == 0
+
+
 def test_agent_alias_task_is_answered_too(session_context, wait_run_env, run_agent_cmd, module_mts):
     env = _env(wait_run_env)
     ans = _call(module_mts, "Task", _agent_event("ECHO:gamma"), env, _prefix(run_agent_cmd))
@@ -213,6 +229,13 @@ def test_send_message_matches_native_shape(
     )
     _assert_send_output(ans)
     assert ans == {"result": {"success": True, "message": "b"}}
+    # The message is the resumed run's own answer, not a constant: a different echo differs.
+    ans2 = _call(
+        module_mts, "SendMessage",
+        {"to": origin, "message": "ECHO:zulu"},
+        env, _prefix(send_message_cmd),
+    )
+    assert ans2 == {"result": {"success": True, "message": "zulu"}}
 
 
 def test_send_message_non_uuid_goes_to_next(session_context, wait_run_env, send_message_cmd, module_mts):
