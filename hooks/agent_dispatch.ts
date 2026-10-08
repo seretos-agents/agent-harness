@@ -14,9 +14,14 @@ import type { On } from 'claude-code'
  * UserPromptSubmit), so they are as fresh as the last prompt of the turn.
  */
 
-type Spawned = { exitCode?: number; code?: number; status?: number; stdout?: string; stderr?: string }
-
 const BUILTIN_RESULT_NOTE = 'agent-harness could not run Agent through the harness'
+
+type Chunk = { stream?: string; text?: string }
+
+type Dollar = {
+  process: { spawn: (o: { argv: string[] }) => AsyncIterable<Chunk> }
+  plugin: { root: string }
+}
 
 /** The binary under bin/ for the host OS, named directly (the extensionless dispatcher is a POSIX script). */
 function binaryOf(root: string): string {
@@ -26,36 +31,102 @@ function binaryOf(root: string): string {
   return `${root.replace(/[\\/]+$/, '')}${sep}bin${sep}${isWindows ? 'harness.exe' : 'harness-linux'}`
 }
 
+/**
+ * An error answer. A resolved `result` is validated against the tool's output schema, which
+ * has no error channel (an `{isError}` object fails it, #82); `deny` is rendered as an
+ * is_error tool_result instead.
+ */
 function fail(text: string) {
-  return { result: { isError: true, text } }
+  return { deny: text }
 }
 
-/** Run `harness <argv>` and map its exit code to the native tool result (0 completed; 1/3 failed/cancelled run; else error). */
-async function runHarness($: { process: { spawn: (...a: any[]) => Promise<unknown> }; plugin: { root: string } }, argv: string[], what: string) {
-  const done = (await $.process.spawn(binaryOf($.plugin.root), argv)) as Spawned
-  const code = done.exitCode ?? done.code ?? done.status
-  const stdout = (done.stdout ?? '').trim()
-  const stderr = (done.stderr ?? '').trim()
+const num = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0)
+const nullableNum = (value: unknown): number | null => (typeof value === 'number' && Number.isFinite(value) ? value : null)
 
-  if (code === 0 || code === 1 || code === 3) {
-    const run = JSON.parse(stdout.split('\n').filter(line => line.trim() !== '').pop() ?? '{}') as Record<string, unknown>
-    const text = typeof run.text === 'string' ? run.text : ''
+/** Keep a usage sub-object only when every field is a number, else null (the schema's nullable keys). */
+function subUsage(value: unknown, keys: string[]): Record<string, number> | null {
+  if (typeof value !== 'object' || value === null) {
+    return null
+  }
 
-    if (code !== 0) {
-      return fail(`harness run ${String(run.run_id)} ended ${String(run.state)}: ${text}`)
-    }
+  const obj = value as Record<string, unknown>
 
-    return {
-      result: {
-        status: 'completed',
-        agentId: run.run_id,
-        content: [{ type: 'text', text }],
-        usage: run.usage ?? {},
-      },
+  if (!keys.every(key => typeof obj[key] === 'number' && Number.isFinite(obj[key] as number))) {
+    return null
+  }
+
+  return Object.fromEntries(keys.map(key => [key, obj[key] as number]))
+}
+
+function normUsage(raw: unknown) {
+  const u = (typeof raw === 'object' && raw !== null ? raw : {}) as Record<string, unknown>
+
+  return {
+    input_tokens: num(u.input_tokens),
+    output_tokens: num(u.output_tokens),
+    cache_creation_input_tokens: nullableNum(u.cache_creation_input_tokens),
+    cache_read_input_tokens: nullableNum(u.cache_read_input_tokens),
+    server_tool_use: subUsage(u.server_tool_use, ['web_search_requests', 'web_fetch_requests']),
+    service_tier: typeof u.service_tier === 'string' ? u.service_tier : null,
+    cache_creation: subUsage(u.cache_creation, ['ephemeral_1h_input_tokens', 'ephemeral_5m_input_tokens']),
+  }
+}
+
+/** The run record as the native Agent `completed` output (Claude Code 2.1.294's output shape). */
+function agentOutput(run: Record<string, unknown>, prompt: string) {
+  const usage = normUsage(run.usage)
+  const text = typeof run.text === 'string' ? run.text : ''
+
+  return {
+    status: 'completed' as const,
+    prompt,
+    agentId: String(run.run_id),
+    content: [{ type: 'text' as const, text }],
+    totalToolUseCount: 0,
+    totalDurationMs: Math.round(num(run.duration_s) * 1000),
+    totalTokens: usage.input_tokens + usage.output_tokens + (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0),
+    usage,
+    canContinueAgent: true,
+  }
+}
+
+/**
+ * Run `harness <argv>` and read the run off its stdout (one JSON line with `state` on exits
+ * 0/1/3, nothing on exit 4). `$.process.spawn` is a stream with no timeout, which a ~1000 s run needs.
+ * Returns the run record, or a deny.
+ */
+async function runHarness($: Dollar, argv: string[], what: string): Promise<{ run: Record<string, unknown> } | { deny: string }> {
+  let stdout = ''
+  let stderr = ''
+
+  for await (const chunk of $.process.spawn({ argv: [binaryOf($.plugin.root), ...argv] })) {
+    if (chunk.stream === 'stderr') {
+      stderr += chunk.text ?? ''
+    } else if (chunk.stream === 'stdout') {
+      stdout += chunk.text ?? ''
     }
   }
 
-  return fail(`${BUILTIN_RESULT_NOTE}: ${stderr !== '' ? stderr : `harness ${what} exited ${String(code)}`}`)
+  const last = stdout.split('\n').filter(line => line.trim() !== '').pop()
+  let run: Record<string, unknown> | undefined
+
+  try {
+    run = last === undefined ? undefined : (JSON.parse(last) as Record<string, unknown>)
+  } catch {
+    run = undefined
+  }
+
+  if (run === undefined || typeof run.state !== 'string') {
+    const err = stderr.trim()
+
+    return fail(`${BUILTIN_RESULT_NOTE}: ${err !== '' ? err : `harness ${what} printed no run`}`)
+  }
+
+  if (run.state !== 'COMPLETED') {
+    return fail(`harness run ${String(run.run_id)} ended ${run.state}: ${typeof run.text === 'string' ? run.text : ''}`)
+  }
+
+  return { run }
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -83,7 +154,9 @@ export function register(on: On) {
         argv.push('--description', description)
       }
 
-      return await runHarness($, argv, 'run-agent')
+      const done = await runHarness($, argv, 'run-agent')
+
+      return 'deny' in done ? done : { result: agentOutput(done.run, prompt) }
     } catch (error) {
       return fail(`${BUILTIN_RESULT_NOTE}: ${error instanceof Error ? error.message : String(error)}`)
     }
@@ -100,7 +173,9 @@ export function register(on: On) {
         return next(e)
       }
 
-      return await runHarness($, ['send-message', '--to', to, '--message', message], 'send-message')
+      const done = await runHarness($, ['send-message', '--to', to, '--message', message], 'send-message')
+
+      return 'deny' in done ? done : { result: { success: true, message: typeof done.run.text === 'string' ? done.run.text : '' } }
     } catch (error) {
       return fail(`${BUILTIN_RESULT_NOTE}: ${error instanceof Error ? error.message : String(error)}`)
     }

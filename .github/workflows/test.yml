@@ -48,6 +48,14 @@ jobs:
           cache: "pip"
           cache-dependency-path: pyproject.toml
 
+      # #82: tests/test_agent_dispatch_module.py runs hooks/agent_dispatch.ts under Node
+      # (type stripping needs >= 22.6). The tests fail, not skip, when CI is set and Node
+      # is missing or too old.
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
       - name: Install plugin + test deps
         shell: bash
         run: |
