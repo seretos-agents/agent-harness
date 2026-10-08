@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -238,34 +239,46 @@ def test_live_hook_failure_never_native():
         shutil.rmtree(root, ignore_errors=True)
 
 
-@pytest.mark.skipif(
-    os.environ.get("HARNESS_LIVE_LONG") != "1",
-    reason="costs >= 1100 s; set HARNESS_LIVE_LONG=1 to run",
-)
 @pytest.mark.timeout(1800)
-def test_live_long_runner_1100s():
-    """L4: a child running two 560 s Bash sleeps completes through the hook, so the call
-    is not bound by any hook-style limit."""
+def test_live_native_agent_long_script():
+    """L4 (#82): the ticket's real-session call -- one native `Agent` call whose child runs a
+    ~1040 s script -- resolves with a result Claude Code's output schema accepts (no "does
+    not match its output shape"), and is not bound by any hook-style limit.
+
+    Claude Code caps a single Bash call at 600000 ms unless BASH_MAX_TIMEOUT_MS is raised, so
+    the script is run as two sequential Bash calls (each `sleep 520`, timeout 600000), which
+    keeps the total above 1000 s without depending on that cap."""
     _require_live()
-    root = Path(tempfile.mkdtemp(prefix="ah76-"))
+    root = Path(tempfile.mkdtemp(prefix="ah82-"))
     try:
         plugin = _build_plugin_dir(root)
         env, project, artifacts = _session_env(root)
+        marker = f"LONGDONE-{uuid.uuid4().hex}"
+        script = "\n".join(["#!/bin/sh", "sleep 520", f"echo {marker}", ""])
+        (project / "long.sh").write_text(script, encoding="utf-8", newline="\n")
         proc, wall = _claude(
             plugin, project, env,
-            "Use the Agent tool with subagent_type general-purpose and the prompt "
-            "'Run the Bash command `sleep 560` twice in sequence (two separate Bash calls, "
-            "timeout 600000 ms each), then reply DONE.' Do nothing else.",
+            "Make exactly one Agent tool call (subagent_type general-purpose) with this prompt: "
+            "'Run the Bash command `sh long.sh` (timeout 600000 ms), then run it a second time "
+            "(a separate Bash call, timeout 600000 ms), then reply with exactly the last line "
+            "the second run printed.' Then reply with exactly the answer that call returns. "
+            "Do nothing else.",
             timeout=1750,
         )
         entries = _stream(proc)
         calls = _agent_calls(entries)
-        assert calls, f"the model never made a native Agent call:\n{proc.stdout[-2000:]!r}"
-        block, _ = _result_for(entries, calls[0]["id"])
+        assert len(calls) == 1, f"expected exactly one Agent call: {proc.stdout[-2000:]!r}"
+        block, entry = _result_for(entries, calls[0]["id"])
         assert block is not None and not block.get("is_error"), block
+        assert "does not match its output shape" not in json.dumps(block), block
         records = _records(artifacts)
         assert len(records) == 1 and records[0]["state"] == {"__runstate__": "COMPLETED"}, records
-        assert wall >= 1100, wall
+        structured = (entry or {}).get("tool_use_result")
+        assert isinstance(structured, dict), entry
+        assert structured.get("status") == "completed", structured
+        assert structured.get("agentId") == [d.name for d in artifacts.iterdir() if (d / "record.json").is_file()][0], structured
+        assert marker in _tool_result_text(block), block
+        assert wall >= 1000, wall
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
