@@ -5,6 +5,11 @@
 // argv: <module.mts path> <tool name> <event JSON>
 // env:  HARNESS_DRIVER_CMD  JSON argv prefix replacing the plugin binary, i.e. the
 //                           `harness` launcher WITHOUT a subcommand (e.g. [python, -m, harness_plugin]).
+//       HARNESS_DRIVER_HOST_ENV  REQUIRED. JSON object: the child's base environment, i.e. what the
+//                           engine's HOST process hands a `$.process.spawn` child. The child gets
+//                           exactly this plus the spawn request's `env`; the node process's own
+//                           environment is never passed on implicitly (#84).
+//       HARNESS_DRIVER_SESSION_ID  what the fake `$.session.id()` resolves; it rejects when unset.
 //
 // Engine contract mirrored (Claude Code 2.1.294): `$.process.spawn({argv, cwd?, env?, input?})`
 // takes ONE object with an array `argv` and returns an async stream of
@@ -14,6 +19,10 @@ import { pathToFileURL } from 'node:url'
 
 const [modulePath, toolName, eventJson] = process.argv.slice(2)
 const prefix = JSON.parse(process.env.HARNESS_DRIVER_CMD ?? '[]')
+if (process.env.HARNESS_DRIVER_HOST_ENV === undefined) {
+  throw new Error('HARNESS_DRIVER_HOST_ENV is required: the driver passes no implicit environment to the child')
+}
+const hostEnv = JSON.parse(process.env.HARNESS_DRIVER_HOST_ENV)
 const NEXT_SENTINEL = { passedToNext: true }
 
 function spawnStream(o) {
@@ -27,7 +36,7 @@ function spawnStream(o) {
 
 async function* streamOf(o) {
   const [cmd, ...args] = [...prefix, ...o.argv.slice(1)]
-  const child = spawn(cmd, args, { cwd: o.cwd, env: { ...process.env, ...(o.env ?? {}) }, stdio: ['pipe', 'pipe', 'pipe'] })
+  const child = spawn(cmd, args, { cwd: o.cwd, env: { ...hostEnv, ...(o.env ?? {}) }, stdio: ['pipe', 'pipe', 'pipe'] })
   const queue = []
   let wake = null
   let open = 2
@@ -68,6 +77,15 @@ async function* streamOf(o) {
 
 const $ = {
   process: { spawn: spawnStream },
+  session: {
+    id: async () => {
+      const id = process.env.HARNESS_DRIVER_SESSION_ID
+      if (id === undefined) {
+        throw new Error('HARNESS_DRIVER_SESSION_ID is not set')
+      }
+      return id
+    },
+  },
   plugin: { root: process.env.HARNESS_DRIVER_PLUGIN_ROOT ?? 'C:\dummy\plugin' },
 }
 
