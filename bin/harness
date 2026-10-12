@@ -1,0 +1,18 @@
+#!/bin/sh
+# #53: every launch point (both hooks.json commands, both MCP manifests)
+# names this exact extensionless path, `bin/harness`. Native Windows
+# spawners (Node/libuv for Claude Code's MCP launch, Rust's std::process for
+# Codex) never run an extensionless file as-is -- they append .com/.exe and
+# land on bin/harness.exe directly, bypassing this script entirely. Only a
+# POSIX shell (Linux, or Git Bash on Windows running a hooks.json command)
+# ever executes this file literally, so it has to pick the right real binary
+# for whichever POSIX environment it is actually running under.
+#
+# `$0` is guaranteed to contain a slash here (the kernel/MSYS always passes a
+# resolved path to a script invoked via its shebang, including PATH lookups),
+# so `${0%/*}` reliably yields this script's own directory.
+d=${0%/*}
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) exec "$d/harness.exe" "$@" ;;
+  *)                    exec "$d/harness-linux" "$@" ;;
+esac
