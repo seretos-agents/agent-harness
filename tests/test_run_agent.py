@@ -265,8 +265,11 @@ def _child_setup(tmp_path, project_dir, session_context):
     """Parent file (acceptEdits/high, newer mtime) next to the child's own file
     (bypassPermissions/low, child_project)."""
     child_project = _child_project(tmp_path, project_dir)
-    data = tmp_path / "plugin-data"
+    # The launched branch reads the home mirror and drops CLAUDE_PLUGIN_DATA (which the
+    # env still carries, pointing at an empty dir), so plant there only.
+    data = tmp_path / "home" / ".agent-harness"
     parent_file = data / "sessions" / f"{SESSION_ID}.json"
+    plant_session_file(data, **session_context)
     plant_session_file(
         data, CHILD_SESSION, cwd=str(child_project), project_dir=str(child_project),
         permission_mode="bypassPermissions", effort="low", model="haiku",

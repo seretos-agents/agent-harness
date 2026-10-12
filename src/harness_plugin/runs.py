@@ -488,7 +488,7 @@ def start_agent(
         raise StartRefused(
             "cannot determine the parent session's context: CLAUDE_CODE_SESSION_ID is not "
             "set or no matching session file exists in the sessions dir "
-            f"({sessions_dir()}); refusing to start a child on unconfirmed rights"
+            f"({sessions_dir(session_env)}); refusing to start a child on unconfirmed rights"
         )
     # Refusal rules: no session file at all (above) refuses unconditionally, even with an
     # explicit permission_mode. A SessionStart-only snapshot refuses only when the EFFECTIVE

@@ -346,11 +346,15 @@ def test_agent_session_id_comes_from_module(hooked_session, tmp_path, run_agent_
 
 
 def test_agent_without_session_file_is_denied(tmp_path, run_agent_cmd, module_mts):
-    env = _host_env(tmp_path)
+    foreign = tmp_path / "foreign-plugin-data"
+    foreign.mkdir()
+    env = _host_env(tmp_path, CLAUDE_PLUGIN_DATA=str(foreign))
     ans = _call(module_mts, "Agent", _agent_event(), env, _prefix(run_agent_cmd))
     _assert_deny(ans)
     assert "cannot determine the parent session's context" in ans["deny"]
+    # the message names the dir actually searched (home mirror), not the foreign env's one
     assert str(tmp_path / "home" / ".agent-harness" / "sessions") in ans["deny"]
+    assert str(foreign) not in ans["deny"]
 
 
 def test_agent_in_harness_child_uses_own_session(tmp_path, project_dir, run_agent_cmd, module_mts):
@@ -377,7 +381,7 @@ def test_agent_in_harness_child_uses_own_session(tmp_path, project_dir, run_agen
         HARNESS_LAUNCHED_AGENT="demo", CLAUDE_PROJECT_DIR=str(project_dir),
     )
     ans = _call(
-        module_mts, "Agent", _agent_event(), env, _prefix(run_agent_cmd),
+        module_mts, "Agent", _agent_event(subagent_type="effort-agent"), env, _prefix(run_agent_cmd),
         session_id="child-session", cwd=str(child_project),
     )
     _assert_agent_output(ans)

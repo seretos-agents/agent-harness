@@ -336,13 +336,20 @@ def main() -> int:
 
     try:
         record = {k: data[k] for k in _KEYS if isinstance(data.get(k), str) and data[k]}
-        if "session_id" in record:
-            project = os.environ.get(PROJECT_ENV)
-            if project:
-                record["project_dir"] = project
-            write_session_context(record)
     except Exception:
-        pass
+        record = {}
+    if "session_id" in record:
+        project = os.environ.get(PROJECT_ENV)
+        if project:
+            record["project_dir"] = project
+        # #84: the second copy is the env-free mirror under ~/.agent-harness/sessions, the one
+        # place the module's `run-agent` (spawned under the host env) can reach. Separate
+        # fail-open tries: one blocked location must not kill the other.
+        for env in (None, {}):
+            try:
+                write_session_context(record, env)
+            except Exception:
+                pass
 
     if event == "Stop":
         session_id = data.get("session_id")
