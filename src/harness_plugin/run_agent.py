@@ -42,7 +42,8 @@ exit codes:
   0  run COMPLETED
   1  run FAILED
   3  run CANCELLED (stopped from another process)
-  4  error: unknown agent, refused session context, caller may not spawn (canSpawn),
+  4  error: unknown agent, refused session context (not found in the sessions
+     dir for --session-id / CLAUDE_CODE_SESSION_ID), caller may not spawn (canSpawn),
      invalid arguments
 
 There is no timeout: the call blocks until the run ends and never cancels it.
@@ -67,6 +68,12 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--prompt", required=True, help="the run's task")
     p.add_argument("--model", default=None, help="model override (default: the agent's / session's)")
     p.add_argument("--description", default=None, help="short label for the run")
+    p.add_argument(
+        "--session-id",
+        default=None,
+        help="the parent session's id; its context is read from ~/.agent-harness/sessions "
+        "(the hook's env-free mirror) instead of CLAUDE_CODE_SESSION_ID / CLAUDE_PLUGIN_DATA",
+    )
     return p
 
 
@@ -86,15 +93,19 @@ def main(argv: list[str]) -> int:
     agent = args.subagent_type
     if agent in _BUILTIN_AGENT_TYPES:
         agent = f"agent-harness:{agent}"
-    # Inside a harness child (#77): its own session file by exact id, never the parent's
-    # newest-file fallback (CLAUDE_PROJECT_DIR is inherited from the parent).
+    # Exact session id, never the newest-file fallback: inside a harness child (#77) the
+    # launched id wins; otherwise the module names the parent via --session-id (#84). The
+    # lookup env drops CLAUDE_PROJECT_DIR (inherited from the parent) and CLAUDE_PLUGIN_DATA
+    # (the spawner's host env has no trustworthy one), so the home mirror is searched.
     session_env = None
-    launched_session = os.environ.get(LAUNCHED_SESSION_ENV)
-    if launched_session:
+    session = os.environ.get(LAUNCHED_SESSION_ENV) or args.session_id
+    if session:
         session_env = {
-            k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("CLAUDE_PROJECT_DIR", "CLAUDE_PLUGIN_DATA")
         }
-        session_env["CLAUDE_CODE_SESSION_ID"] = launched_session
+        session_env["CLAUDE_CODE_SESSION_ID"] = session
     try:
         started, _used, _source = start_agent(
             agent,

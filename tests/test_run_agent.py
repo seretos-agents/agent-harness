@@ -265,8 +265,11 @@ def _child_setup(tmp_path, project_dir, session_context):
     """Parent file (acceptEdits/high, newer mtime) next to the child's own file
     (bypassPermissions/low, child_project)."""
     child_project = _child_project(tmp_path, project_dir)
-    data = tmp_path / "plugin-data"
+    # The launched branch reads the home mirror and drops CLAUDE_PLUGIN_DATA (which the
+    # env still carries, pointing at an empty dir), so plant there only.
+    data = tmp_path / "home" / ".agent-harness"
     parent_file = data / "sessions" / f"{SESSION_ID}.json"
+    plant_session_file(data, **session_context)
     plant_session_file(
         data, CHILD_SESSION, cwd=str(child_project), project_dir=str(child_project),
         permission_mode="bypassPermissions", effort="low", model="haiku",
@@ -385,3 +388,47 @@ def test_run_agent_injects_launched_session_id(
     session_id = _flag(entry["argv"], "--session-id")
     assert session_id
     assert entry["launched_session"] == session_id
+
+
+# --- #84: --session-id names the parent; the lookup is the env-free home mirror ----------
+
+
+def _mirror_only_env(tmp_path, project_dir, wait_run_env):
+    """The session file exists only in the home mirror; the env carries a plugin-data dir
+    without it, a CLAUDE_PROJECT_DIR that matches it, and a decoy CLAUDE_CODE_SESSION_ID."""
+    plant_session_file(
+        tmp_path / "home" / ".agent-harness", SESSION_ID, cwd=str(project_dir),
+        project_dir=str(project_dir), permission_mode="acceptEdits", effort="high", model="opus",
+    )
+    return {
+        **wait_run_env,
+        "CLAUDE_PLUGIN_DATA": str(tmp_path / "plugin-data"),
+        "CLAUDE_PROJECT_DIR": str(project_dir),
+        "CLAUDE_CODE_SESSION_ID": "other",
+    }
+
+
+def test_run_agent_session_id_flag(tmp_path, project_dir, wait_run_env, run_agent_cmd):
+    env = _mirror_only_env(tmp_path, project_dir, wait_run_env)
+    code, out, err = _run_cli(
+        run_agent_cmd, env, "--subagent-type", "demo", "--prompt", "ECHO:alpha",
+        "--session-id", SESSION_ID,
+    )
+    assert code == 0, (out, err)
+    payload = _one_json(out)
+    assert payload["state"] == "COMPLETED"
+    assert payload["text"] == "alpha"
+    assert _flag(_argv_entries(env)[-1]["argv"], "--permission-mode") == "acceptEdits"
+
+
+def test_run_agent_session_id_flag_unknown_id_exits_four(tmp_path, project_dir, wait_run_env, run_agent_cmd):
+    """No newest-file fallback on this path, even though CLAUDE_PROJECT_DIR matches a mirrored file."""
+    env = _mirror_only_env(tmp_path, project_dir, wait_run_env)
+    code, out, err = _run_cli(
+        run_agent_cmd, env, "--subagent-type", "demo", "--prompt", "ECHO:alpha",
+        "--session-id", "missing",
+    )
+    assert code == 4, (out, err)
+    assert out.strip() == ""
+    assert "cannot determine the parent session's context" in err
+    assert not Path(env["HARNESS_FAKE_ARGV_LOG"]).exists()

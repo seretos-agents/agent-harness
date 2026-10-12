@@ -28,6 +28,11 @@ PRE_TOOL_USE = {
 }
 
 
+def _hook_home(plugin_data):
+    plugin_data = Path(plugin_data)
+    return plugin_data.parent / f"{plugin_data.name}-hook-home"
+
+
 def _hook_env(plugin_data, project_dir="/work/project", extra_env=None):
     env = {
         k: v
@@ -43,6 +48,10 @@ def _hook_env(plugin_data, project_dir="/work/project", extra_env=None):
     }
     env["CLAUDE_PLUGIN_DATA"] = str(plugin_data)
     env["CLAUDE_PROJECT_DIR"] = project_dir
+    # #84: the hook also writes an env-free mirror under the home dir; keep it out of the
+    # developer's real home.
+    home = _hook_home(plugin_data)
+    env["HOME"] = env["USERPROFILE"] = str(home)
     # #64: a real internal wait defaults to 7200s -- keep every test above
     # (and any test below that does not care about the wait itself) a single
     # snapshot, matching #62's behavior, unless a test opts in via extra_env.
@@ -129,6 +138,22 @@ def test_hook_writes_session_context(tmp_path):
     }
 
 
+def test_hook_mirrors_session_context(tmp_path):
+    """#84: the record is also written to ~/.agent-harness/sessions, the one location the
+    hooks module's host-env child can reach, on every event that writes."""
+    for event in ("SessionStart", "UserPromptSubmit", "PreToolUse"):
+        mirror = _hook_home(tmp_path) / ".agent-harness" / "sessions" / "sess-abc.json"
+        if mirror.exists():
+            mirror.unlink()
+        payload = {**PRE_TOOL_USE, "hook_event_name": event}
+        proc = run_hook(json.dumps(payload), tmp_path)
+        assert proc.returncode == 0, proc.stderr
+        assert mirror.is_file(), f"{event}: no mirror file; stderr={proc.stderr!r}"
+        copy = json.loads((tmp_path / "sessions" / "sess-abc.json").read_text(encoding="utf-8"))
+        assert copy["project_dir"] == "/work/project"
+        assert json.loads(mirror.read_text(encoding="utf-8")) == copy
+
+
 def test_session_start_payload_without_permission_mode_is_written(tmp_path):
     payload = {
         "session_id": "sess-start",
@@ -167,6 +192,8 @@ def test_unwritable_sessions_dir_exits_zero(tmp_path):
     blocker.write_text("occupied", encoding="utf-8")  # mkdir under a file must fail
     proc = run_hook(json.dumps(PRE_TOOL_USE), blocker)
     assert proc.returncode == 0, proc.stderr
+    # A blocked plugin-data dir does not take the home mirror down with it (#84).
+    assert (_hook_home(blocker) / ".agent-harness" / "sessions" / "sess-abc.json").is_file()
 
 
 # --- #52: native Agent/Task subagent dispatch is denied at PreToolUse -------

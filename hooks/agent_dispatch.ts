@@ -21,6 +21,7 @@ type Chunk = { stream?: string; text?: string }
 type Dollar = {
   process: { spawn: (o: { argv: string[] }) => AsyncIterable<Chunk> }
   plugin: { root: string }
+  session: { id: () => Promise<string> }
 }
 
 /** The binary under bin/ for the host OS, named directly (the extensionless dispatcher is a POSIX script). */
@@ -142,7 +143,8 @@ export function register(on: On) {
         return fail(`${BUILTIN_RESULT_NOTE}: the Agent call has no prompt`)
       }
 
-      const argv = ['run-agent', '--subagent-type', str('subagent_type') ?? 'general-purpose', '--prompt', prompt]
+      // #84: the spawn gets the host env, so the parent is named explicitly.
+      const argv = ['run-agent', '--subagent-type', str('subagent_type') ?? 'general-purpose', '--prompt', prompt, '--session-id', await $.session.id()]
       const model = str('model')
       const description = str('description')
 

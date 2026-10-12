@@ -6,6 +6,10 @@ A fake engine `$` (tests/agent_dispatch_driver.mjs) mirrors Claude Code's contra
 `tool.call` answer is validated against the tool's output shape -- anything else is the
 ticket's "result that does not match its output shape" failure. Errors must be `{deny}`.
 
+#84: the module's child sees the engine's HOST env, not the hook env. The tests build the two
+separately (`_host_env` / `_run_hook`), write the session file by running the real
+`harness hook`, and the driver passes the child exactly the host env it is given.
+
 Needs `node` >= 22.6 (type stripping); skipped without it, but a FAILURE when `CI` is set,
 so CI cannot silently skip these."""
 import json
@@ -18,9 +22,9 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import FAKE_CLAUDE, REPO
+from conftest import FAKE_CLAUDE, REPO, SESSION_ID, _base_env
 from lib_python_harness import FileRunStore, Harness
-from test_run_agent import _env, _one_json, _only_run_id, _stored_result
+from test_run_agent import _argv_entries, _flag, _one_json, _only_run_id, _stored_result
 from test_send_message import _origin
 
 DRIVER = Path(__file__).parent / "agent_dispatch_driver.mjs"
@@ -55,11 +59,75 @@ def module_mts(tmp_path) -> Path:
     return dest
 
 
-def _driver_popen(module_mts, tool, event, env, prefix):
+def _os_base() -> dict:
+    """The OS environment minus every CLAUDE_*/HARNESS_* key (keeps PATH/SYSTEMROOT)."""
+    return {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "HARNESS_"))}
+
+
+def _host_env(tmp_path, **extra) -> dict:
+    """What the engine's host process hands a `$.process.spawn` child (#84): the session id,
+    HOME, the test knobs -- and NONE of CLAUDE_PLUGIN_DATA / CLAUDE_PLUGIN_ROOT / CLAUDE_PROJECT_DIR
+    unless a test passes them. A None value in `extra` removes the key."""
+    base = _base_env(tmp_path)
+    home = base["HOME"]
+    env = {
+        **_os_base(),
+        "HARNESS_CLAUDE_ARGV": base["HARNESS_CLAUDE_ARGV"],
+        "HARNESS_ARTIFACTS_DIR": base["HARNESS_ARTIFACTS_DIR"],
+        "HARNESS_FAKE_ARGV_LOG": base["HARNESS_FAKE_ARGV_LOG"],
+        "CLAUDE_CONFIG_DIR": base["CLAUDE_CONFIG_DIR"],
+        "HOME": home,
+        "USERPROFILE": home,
+        "CLAUDE_CODE_SESSION_ID": SESSION_ID,
+    }
+    env.update(extra)
+    return {k: v for k, v in env.items() if v is not None}
+
+
+def _hook_cmd() -> list:
+    binary = os.environ.get("HARNESS_BIN")
+    return [binary, "hook"] if binary else [sys.executable, "-m", "harness_plugin", "hook"]
+
+
+def _run_hook(tmp_path, payload, project, data_name="plugin-data"):
+    """The REAL `harness hook` under the HOOK env (per-plugin variables set), same HOME."""
+    home = str(tmp_path / "home")
+    env = {
+        **_os_base(),
+        "CLAUDE_PLUGIN_DATA": str(tmp_path / data_name),
+        "CLAUDE_PROJECT_DIR": str(project),
+        "HOME": home,
+        "USERPROFILE": home,
+    }
+    proc = subprocess.run(
+        _hook_cmd(), input=json.dumps(payload), capture_output=True, text=True, env=env, timeout=60
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def _prompt_payload(session_id, cwd, mode):
+    return {
+        "hook_event_name": "UserPromptSubmit", "session_id": session_id, "cwd": str(cwd),
+        "permission_mode": mode, "model": "opus", "effort": "high",
+    }
+
+
+@pytest.fixture
+def hooked_session(tmp_path, project_dir):
+    """SessionStart then UserPromptSubmit for SESSION_ID through the real hook."""
+    _run_hook(tmp_path, {"hook_event_name": "SessionStart", "session_id": SESSION_ID, "cwd": str(project_dir)}, project_dir)
+    _run_hook(tmp_path, _prompt_payload(SESSION_ID, project_dir, "bypassPermissions"), project_dir)
+
+
+def _driver_popen(module_mts, tool, event, env, prefix, session_id=SESSION_ID, cwd=None):
+    """`env` is the HOST env handed to the module's spawn children; the node process itself
+    runs under the bare OS base so nothing of the pytest env can reach them."""
+    driver_env = {**_os_base(), "HARNESS_DRIVER_CMD": json.dumps(prefix), "HARNESS_DRIVER_HOST_ENV": json.dumps(env)}
+    if session_id is not None:
+        driver_env["HARNESS_DRIVER_SESSION_ID"] = session_id
     return subprocess.Popen(
         [_node(), "--experimental-strip-types", "--no-warnings", str(DRIVER), str(module_mts), tool, json.dumps(event)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        env={**env, "HARNESS_DRIVER_CMD": json.dumps(prefix)},
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=driver_env, cwd=cwd,
     )
 
 
@@ -69,8 +137,8 @@ def _answer(proc, timeout=DRIVER_TIMEOUT):
     return _one_json(out)
 
 
-def _call(module_mts, tool, event, env, prefix):
-    return _answer(_driver_popen(module_mts, tool, event, env, prefix))
+def _call(module_mts, tool, event, env, prefix, **kw):
+    return _answer(_driver_popen(module_mts, tool, event, env, prefix, **kw))
 
 
 def _is_num(x):
@@ -126,8 +194,8 @@ def _prefix(cmd):
     return cmd[:-1]
 
 
-def test_agent_completed_matches_native_shape(session_context, wait_run_env, run_agent_cmd, module_mts):
-    env = _env(wait_run_env)
+def test_agent_completed_matches_native_shape(hooked_session, tmp_path, run_agent_cmd, module_mts):
+    env = _host_env(tmp_path)
     ans = _call(module_mts, "Agent", _agent_event(), env, _prefix(run_agent_cmd))
     _assert_agent_output(ans)
     assert "result" in ans, ans
@@ -139,8 +207,8 @@ def test_agent_completed_matches_native_shape(session_context, wait_run_env, run
     assert r["totalDurationMs"] >= 0 and r["totalTokens"] >= 0
 
 
-def test_agent_totals_are_computed_from_the_run_record(session_context, wait_run_env, run_agent_cmd, module_mts):
-    env = _env(wait_run_env)
+def test_agent_totals_are_computed_from_the_run_record(hooked_session, tmp_path, run_agent_cmd, module_mts):
+    env = _host_env(tmp_path)
     ans = _call(module_mts, "Agent", _agent_event("ECHO:alpha SLEEP:1 USAGE"), env, _prefix(run_agent_cmd))
     _assert_agent_output(ans)
     r = ans["result"]
@@ -155,15 +223,15 @@ def test_agent_totals_are_computed_from_the_run_record(session_context, wait_run
     assert r["totalToolUseCount"] == 0
 
 
-def test_agent_alias_task_is_answered_too(session_context, wait_run_env, run_agent_cmd, module_mts):
-    env = _env(wait_run_env)
+def test_agent_alias_task_is_answered_too(hooked_session, tmp_path, run_agent_cmd, module_mts):
+    env = _host_env(tmp_path)
     ans = _call(module_mts, "Task", _agent_event("ECHO:gamma"), env, _prefix(run_agent_cmd))
     _assert_agent_output(ans)
     assert ans["result"]["content"][0]["text"] == "gamma"
 
 
-def test_agent_failed_is_deny(session_context, wait_run_env, run_agent_cmd, module_mts):
-    env = _env(wait_run_env)
+def test_agent_failed_is_deny(hooked_session, tmp_path, run_agent_cmd, module_mts):
+    env = _host_env(tmp_path)
     ans = _call(module_mts, "Agent", _agent_event("NO_RESULT"), env, _prefix(run_agent_cmd))
     _assert_deny(ans)
     assert _only_run_id(env) in ans["deny"]
@@ -179,8 +247,8 @@ def test_agent_failed_is_deny(session_context, wait_run_env, run_agent_cmd, modu
         "yield CANCELLED on Windows; covered on Linux"
     ),
 )
-def test_agent_cancelled_is_deny(session_context, wait_run_env, run_agent_cmd, module_mts):
-    env = _env(wait_run_env)
+def test_agent_cancelled_is_deny(hooked_session, tmp_path, run_agent_cmd, module_mts):
+    env = _host_env(tmp_path)
     proc = _driver_popen(module_mts, "Agent", _agent_event("SLEEP:30"), env, _prefix(run_agent_cmd))
     deadline = time.monotonic() + 30
     run_id = None
@@ -200,8 +268,8 @@ def test_agent_cancelled_is_deny(session_context, wait_run_env, run_agent_cmd, m
     assert run_id in ans["deny"] and "CANCELLED" in ans["deny"]
 
 
-def test_agent_unknown_agent_is_deny_with_note(session_context, wait_run_env, run_agent_cmd, module_mts):
-    env = _env(wait_run_env)
+def test_agent_unknown_agent_is_deny_with_note(hooked_session, tmp_path, run_agent_cmd, module_mts):
+    env = _host_env(tmp_path)
     ev = {**_agent_event(), "subagent_type": "nope"}
     ans = _call(module_mts, "Agent", ev, env, _prefix(run_agent_cmd))
     _assert_deny(ans)
@@ -209,17 +277,17 @@ def test_agent_unknown_agent_is_deny_with_note(session_context, wait_run_env, ru
     assert "unknown agent" in ans["deny"]
 
 
-def test_agent_missing_prompt_is_deny(session_context, wait_run_env, run_agent_cmd, module_mts):
-    env = _env(wait_run_env)
+def test_agent_missing_prompt_is_deny(hooked_session, tmp_path, run_agent_cmd, module_mts):
+    env = _host_env(tmp_path)
     ans = _call(module_mts, "Agent", {"subagent_type": "demo"}, env, _prefix(run_agent_cmd))
     _assert_deny(ans)
     assert "no prompt" in ans["deny"]
 
 
 def test_send_message_matches_native_shape(
-    session_context, wait_run_env, run_agent_cmd, send_message_cmd, module_mts
+    hooked_session, tmp_path, run_agent_cmd, send_message_cmd, module_mts
 ):
-    env = _env(wait_run_env)
+    env = _host_env(tmp_path)
     # Seed the origin run through the CLI so this test isolates the SendMessage answer.
     origin = _origin(run_agent_cmd, env, prompt="ECHO:a")
     ans = _call(
@@ -238,7 +306,84 @@ def test_send_message_matches_native_shape(
     assert ans2 == {"result": {"success": True, "message": "zulu"}}
 
 
-def test_send_message_non_uuid_goes_to_next(session_context, wait_run_env, send_message_cmd, module_mts):
-    env = _env(wait_run_env)
+def test_send_message_non_uuid_goes_to_next(hooked_session, tmp_path, send_message_cmd, module_mts):
+    env = _host_env(tmp_path)
     ans = _call(module_mts, "SendMessage", {"to": "teammate", "message": "hi"}, env, _prefix(send_message_cmd))
     assert ans == {"passedToNext": True}
+
+
+# --- #84: host env vs hook env ---------------------------------------------------------
+
+
+def test_agent_host_env_without_plugin_data_completes(hooked_session, tmp_path, run_agent_cmd, module_mts):
+    env = _host_env(tmp_path)
+    assert not {"CLAUDE_PLUGIN_DATA", "CLAUDE_PLUGIN_ROOT", "CLAUDE_PROJECT_DIR"} & set(env)
+    ans = _call(module_mts, "Agent", _agent_event(), env, _prefix(run_agent_cmd))
+    _assert_agent_output(ans)
+    assert "result" in ans, ans
+    assert ans["result"]["content"][0]["text"] == "alpha"
+    assert _stored_result(env, ans["result"]["agentId"]).state.name == "COMPLETED"
+
+
+def test_agent_foreign_plugin_data_completes(hooked_session, tmp_path, run_agent_cmd, module_mts):
+    foreign = tmp_path / "foreign-plugin-data"
+    foreign.mkdir()
+    env = _host_env(tmp_path, CLAUDE_PLUGIN_DATA=str(foreign))
+    ans = _call(module_mts, "Agent", _agent_event(), env, _prefix(run_agent_cmd))
+    _assert_agent_output(ans)
+    assert "result" in ans, ans
+    assert _stored_result(env, ans["result"]["agentId"]).state.name == "COMPLETED"
+
+
+def test_agent_session_id_comes_from_module(hooked_session, tmp_path, run_agent_cmd, module_mts):
+    """Even without CLAUDE_CODE_SESSION_ID in the host env, `$.session.id()` names the parent."""
+    env = _host_env(tmp_path, CLAUDE_CODE_SESSION_ID=None)
+    assert "CLAUDE_CODE_SESSION_ID" not in env
+    ans = _call(module_mts, "Agent", _agent_event(), env, _prefix(run_agent_cmd), session_id=SESSION_ID)
+    _assert_agent_output(ans)
+    assert "result" in ans, ans
+    assert _flag(_argv_entries(env)[-1]["argv"], "--permission-mode") == "bypassPermissions"
+
+
+def test_agent_without_session_file_is_denied(tmp_path, run_agent_cmd, module_mts):
+    foreign = tmp_path / "foreign-plugin-data"
+    foreign.mkdir()
+    env = _host_env(tmp_path, CLAUDE_PLUGIN_DATA=str(foreign))
+    ans = _call(module_mts, "Agent", _agent_event(), env, _prefix(run_agent_cmd))
+    _assert_deny(ans)
+    assert "cannot determine the parent session's context" in ans["deny"]
+    # the message names the dir actually searched (home mirror), not the foreign env's one
+    assert str(tmp_path / "home" / ".agent-harness" / "sessions") in ans["deny"]
+    assert str(foreign) not in ans["deny"]
+
+
+def test_agent_in_harness_child_uses_own_session(tmp_path, project_dir, run_agent_cmd, module_mts):
+    """#77 through the module: the launched id is authoritative; the parent's newer file and a
+    leaked CLAUDE_PROJECT_DIR must not win."""
+    child_project = tmp_path / "child-project"
+    shutil.copytree(project_dir, child_project)
+    (child_project / ".git").mkdir()
+    (child_project / ".seretos").mkdir()
+    (child_project / ".seretos" / "harness.yml").write_text(
+        "agents:\n  demo:\n    canSpawn: true\n", encoding="utf-8"
+    )
+    _run_hook(tmp_path, _prompt_payload(SESSION_ID, project_dir, "acceptEdits"), project_dir)
+    _run_hook(
+        tmp_path, _prompt_payload("child-session", child_project, "bypassPermissions"), child_project,
+        data_name="child-plugin-data",
+    )
+    parent_file = tmp_path / "home" / ".agent-harness" / "sessions" / f"{SESSION_ID}.json"
+    assert parent_file.is_file(), "the hook wrote no home mirror of the parent session"
+    future = time.time() + 100
+    os.utime(parent_file, (future, future))
+    env = _host_env(
+        tmp_path, CLAUDE_CODE_SESSION_ID=None, HARNESS_LAUNCHED_SESSION_ID="child-session",
+        HARNESS_LAUNCHED_AGENT="demo", CLAUDE_PROJECT_DIR=str(project_dir),
+    )
+    ans = _call(
+        module_mts, "Agent", _agent_event(subagent_type="effort-agent"), env, _prefix(run_agent_cmd),
+        session_id="child-session", cwd=str(child_project),
+    )
+    _assert_agent_output(ans)
+    assert "result" in ans, ans
+    assert _flag(_argv_entries(env)[-1]["argv"], "--permission-mode") == "bypassPermissions"
