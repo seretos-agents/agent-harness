@@ -403,7 +403,38 @@ def jsonable(value: Any) -> Any:
     return value
 
 
+BACKGROUND_WAIT_LABEL = "background_shell_wait"
+
+
+def _background_wait_activity(run_id: str) -> str | None:
+    """`BACKGROUND_WAIT_LABEL` iff the run's child has written a `result` but a
+    `run_in_background: true` launch is still pending (#86): it is waiting for its own
+    background shell command and will write a second `result`. The lib labels that state
+    `text` (newest assistant block), which a caller would read as stalled. Uses the lib's
+    own pending-launch walk (`parse_events().abandoned_background_tasks`), so the rule is
+    the one the lib's wait uses to NOT finalize the run. Never raises."""
+    try:
+        record = harness().store.get(run_id) or {}
+        events_path = record.get("events_path")
+        if not events_path:
+            return None
+        kept = []
+        for line in Path(events_path).read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                if isinstance(json.loads(line), dict):
+                    kept.append(line)
+            except ValueError:
+                continue
+        parsed = ClaudeCliProvider().parse_events(kept)  # ValueError: no `result` yet
+        return BACKGROUND_WAIT_LABEL if parsed.abandoned_background_tasks else None
+    except Exception:
+        return None
+
+
 def run_to_dict(result: Any, **extra: Any) -> dict[str, Any]:
+    last_activity = result.last_activity
+    if result.run_id and jsonable(result.state) == "RUNNING":
+        last_activity = _background_wait_activity(result.run_id) or last_activity
     out = {
         "run_id": result.run_id,
         "session_id": result.session_id,
@@ -418,7 +449,7 @@ def run_to_dict(result: Any, **extra: Any) -> dict[str, Any]:
         "duration_s": result.duration_s,
         "event_count": result.event_count,
         "last_event_at": result.last_event_at,
-        "last_activity": result.last_activity,
+        "last_activity": last_activity,
     }
     if result.run_id:
         out.update(launched_fields(result.run_id))
@@ -445,7 +476,7 @@ class StartRefused(Exception):
 
 
 def _require_can_spawn(config: Any, caller: str) -> None:
-    """The lib's `apply_config` canSpawn rule (lib-python-harness v0.0.12, config/apply.py),
+    """The lib's `apply_config` canSpawn rule (lib-python-harness, config/apply.py, as of v0.0.12),
     mirrored: no config, or neither an `agents:` entry for the caller nor any `defaults:`
     -> allowed; otherwise allowed iff the caller's entry sets `canSpawn: true`. Keep in step
     with the pinned lib version -- the module path has no MCP server whose presence could

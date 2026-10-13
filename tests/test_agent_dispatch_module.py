@@ -393,7 +393,7 @@ def test_agent_in_harness_child_uses_own_session(tmp_path, project_dir, run_agen
 
 BG_HOLD_S = 25  # how long the fake child holds after its first `result` (> grace 3 s + the checks)
 BG_LABEL = "background_shell_wait"
-MIN_CEILING_MS = 600_000  # Claude Code's own default; the child must be given more
+CEILING_MS = "3600000"  # lib-python-harness v0.0.12's default, applied on start and resume
 
 
 def _wait_for_first_result(env, timeout=40):
@@ -429,6 +429,10 @@ def test_agent_background_wait_completes(
     try:
         run_id, _events = _wait_for_first_result(env)
         time.sleep(4)  # past the lib's post-result grace (3 s)
+        # In-process readers (and the Stop driver) must see THIS test's store before the first call.
+        for key in ("HARNESS_ARTIFACTS_DIR", "HARNESS_CLAUDE_ARGV"):
+            monkeypatch.setenv(key, env[key])
+        monkeypatch.setattr(runs, "_HARNESS", None)
 
         # R4: the Stop hook's driver, twice, spaced; the held child is neither killed nor finalized.
         write_context._drive_run(run_id)
@@ -443,9 +447,6 @@ def test_agent_background_wait_completes(
         assert _is_num(w["last_event_at"]), w
 
         # R3: harness_poll_run and harness_wait_run in-process (own Harness, no spawner state).
-        for key in ("HARNESS_ARTIFACTS_DIR", "HARNESS_CLAUDE_ARGV"):
-            monkeypatch.setenv(key, env[key])
-        monkeypatch.setattr(runs, "_HARNESS", None)
         polled = anyio.run(server.harness_poll_run, run_id)
         assert (polled["state"], polled["last_activity"]) == ("RUNNING", BG_LABEL), polled
         assert _is_num(polled["last_event_at"]), polled
@@ -470,7 +471,7 @@ def test_agent_background_wait_completes(
     stored = _stored_result(env, out["result"]["agentId"])
     assert stored.state.name == "COMPLETED" and stored.text == "SLEEP_DONE"
     # R2 (start): the child's env carries a bg-wait ceiling above Claude's own 600 s.
-    assert int(_argv_entries(env)[-1]["bg_wait_ceiling"]) > MIN_CEILING_MS
+    assert _argv_entries(env)[-1]["bg_wait_ceiling"] == CEILING_MS
 
 
 def test_send_message_carries_bg_wait_ceiling(
@@ -483,4 +484,41 @@ def test_send_message_carries_bg_wait_ceiling(
     _assert_send_output(ans)
     entries = _argv_entries(env)
     assert "--resume" in entries[-1]["argv"], entries[-1]["argv"]
-    assert int(entries[-1]["bg_wait_ceiling"]) > MIN_CEILING_MS
+    assert entries[-1]["bg_wait_ceiling"] == CEILING_MS
+
+
+@pytest.mark.parametrize(
+    "events,expected",
+    [
+        ("launch_ack_result", BG_LABEL),  # result written, launch still pending
+        ("plain_result", None),  # result, nothing pending: normal label
+        ("launch_no_result", None),  # launch pending but no result yet: still running normally
+    ],
+)
+def test_background_wait_label_only_with_result_and_pending_launch(tmp_path, monkeypatch, events, expected):
+    """The label is conditional: a RUNNING run keeps its normal label unless a `result` has
+    been written while a `run_in_background` launch is still pending."""
+    from harness_plugin import runs
+
+    launch = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "x", "run_in_background": True}}]}}
+    ack = {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "Command running in background with ID: b1."}]}}
+    result = {"type": "result", "subtype": "success", "is_error": False, "result": "r", "session_id": "s"}
+    seq = {
+        "launch_ack_result": [launch, ack, result],
+        "plain_result": [result],
+        "launch_no_result": [launch, ack],
+    }[events]
+    path = tmp_path / "events.jsonl"
+    path.write_text("\n".join(json.dumps(e) for e in seq) + "\n", encoding="utf-8")
+
+    class _Store:
+        def get(self, run_id):
+            return {"events_path": str(path)}
+
+    class _H:
+        store = _Store()
+
+    monkeypatch.setattr(runs, "harness", lambda: _H())
+    assert runs._background_wait_activity("rid") == expected

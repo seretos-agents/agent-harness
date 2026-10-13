@@ -48,7 +48,7 @@ Output on Windows: `bin/harness.exe`. On Linux: `bin/harness-linux`. The committ
 
 ## Waiting for a long run: `harness wait <run_id>`
 
-No time limit in this plugin ends a run. When `harness_wait_run`'s `timeout_seconds` expires the run keeps going: the tool returns `state: RUNNING` with liveness fields (`duration_s`, `event_count`, `last_event_at`, `last_activity` - the last tool/command the run used) and a `next_step` hint. Only `harness_stop_run` cancels a run. To keep waiting beyond a tool call, run the binary's second entry point from a background shell (see the `harness-wait` skill), or call `harness_wait_run` again:
+No time limit in this plugin ends a run. When `harness_wait_run`'s `timeout_seconds` expires the run keeps going: the tool returns `state: RUNNING` with liveness fields (`duration_s`, `event_count`, `last_event_at`, `last_activity` - the last tool/command the run used; `background_shell_wait` when the child has finished its turn but is waiting for its own `run_in_background` shell command: not stalled, never cancel it) and a `next_step` hint. Only `harness_stop_run` cancels a run. To keep waiting beyond a tool call, run the binary's second entry point from a background shell (see the `harness-wait` skill), or call `harness_wait_run` again:
 
 ```
 harness wait <run_id> [--timeout <seconds>] [--interval <seconds>]

@@ -90,7 +90,7 @@ A wait result and a `harness_poll_run` result carry the same fields:
 - `event_count` and `last_event_at` - progress markers that advance only while `state` is
   RUNNING; once the run is terminal they reset to 0 and None, so only compare them on a
   RUNNING run.
-- `last_activity` - the last tool or command the run used.
+- `last_activity` - the last tool or command the run used. `background_shell_wait` means the child has answered once but is waiting for its own background shell command; it is working, not stalled - keep waiting, never `harness_stop_run`.
 
 Compare a reading against the one before it:
 
