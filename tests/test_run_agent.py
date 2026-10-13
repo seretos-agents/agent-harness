@@ -337,7 +337,7 @@ def test_run_agent_child_can_spawn_false_refuses(
 def test_run_agent_child_can_spawn_unset_refuses(
     tmp_path, project_dir, session_context, wait_run_env, run_agent_cmd, yml
 ):
-    """lib-python-harness v0.0.11 apply_config: any entry/defaults without canSpawn: true."""
+    """lib-python-harness v0.0.12 apply_config: any entry/defaults without canSpawn: true."""
     child_project = _child_setup(tmp_path, project_dir, session_context)
     cfg = child_project / ".seretos"
     cfg.mkdir()
