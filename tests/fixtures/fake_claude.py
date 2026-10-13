@@ -33,6 +33,12 @@ This is #68's reproduction of a CLEAN `claude -p` child that has already told th
 it is done but does not actually exit its OS process for a while: a test can start such a
 run and exercise the grace-kill (`lib_python_harness.Harness.wait`'s `_FINALIZE_GRACE_S`)
 that is supposed to reap it.
+A prompt containing `BG_WAIT:<seconds>` (#86) is the real shape of a child that backgrounds a
+shell command and ends its turn: init, a `Bash` `tool_use` with `run_in_background: true`, its
+ack `tool_result`, an assistant text `waiting`, a FIRST `result` (`waiting`), then the process
+holds `<seconds>` with the launch still pending, and finally the `<task-notification>` for the
+launch, an assistant text `SLEEP_DONE` and a SECOND `result` (`SLEEP_DONE`). Shapes mirror
+lib_python_harness's own `--background-hold` fixture.
 """
 import json
 import os
@@ -70,6 +76,36 @@ ALT_INIT_MCP_SERVERS: list[str] = ["alias-server"]
 ALT_INIT_TOOLS: list[str] = ["AliasTool"]
 
 
+def _emit(event: dict) -> None:
+    print(json.dumps(event), flush=True)
+
+
+def _bg_wait(session_id: str, hold: float) -> int:
+    launch_id, task_id = "toolu_bg1", "bg1"
+    _emit({"type": "assistant", "session_id": session_id, "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "id": launch_id, "name": "Bash",
+         "input": {"command": "sleep 90; echo SLEEP_DONE", "run_in_background": True}}]}})
+    _emit({"type": "user", "session_id": session_id, "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": launch_id,
+         "content": f"Command running in background with ID: {task_id}. Use TaskOutput to read its output."}]}})
+    _emit({"type": "assistant", "session_id": session_id,
+           "message": {"role": "assistant", "content": [{"type": "text", "text": "waiting"}]}})
+    _emit({"type": "result", "subtype": "success", "is_error": False, "result": "waiting",
+           "session_id": session_id, "total_cost_usd": 0.0, "usage": {}})
+    time.sleep(hold)
+    _emit({"type": "user", "session_id": session_id, "message": {"role": "user", "content": (
+        "<task-notification>\n"
+        f"<task-id>{task_id}</task-id>\n"
+        f"<tool-use-id>{launch_id}</tool-use-id>\n"
+        "<status>completed</status>\n"
+        "</task-notification>")}})
+    _emit({"type": "assistant", "session_id": session_id,
+           "message": {"role": "assistant", "content": [{"type": "text", "text": "SLEEP_DONE"}]}})
+    _emit({"type": "result", "subtype": "success", "is_error": False, "result": "SLEEP_DONE",
+           "session_id": session_id, "total_cost_usd": 0.0, "usage": {}})
+    return 0
+
+
 def main() -> int:
     argv = sys.argv[1:]
     if "--version" in argv:
@@ -86,6 +122,7 @@ def main() -> int:
                         "cwd": os.getcwd(),
                         "launched_agent": os.environ.get("HARNESS_LAUNCHED_AGENT"),
                         "launched_session": os.environ.get("HARNESS_LAUNCHED_SESSION_ID"),
+                        "bg_wait_ceiling": os.environ.get("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"),
                     }
                 )
                 + "\n"
@@ -127,6 +164,9 @@ def main() -> int:
             ),
             flush=True,
         )
+    bg = re.search(r"BG_WAIT:(\d+(?:\.\d+)?)", prompt)
+    if bg:
+        return _bg_wait(session_id, float(bg.group(1)))
     if match:
         deadline = time.monotonic() + float(match.group(1))
         while time.monotonic() < deadline:
