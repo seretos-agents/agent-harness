@@ -445,7 +445,7 @@ class StartRefused(Exception):
 
 
 def _require_can_spawn(config: Any, caller: str) -> None:
-    """The lib's `apply_config` canSpawn rule (lib-python-harness v0.0.11, config/apply.py),
+    """The lib's `apply_config` canSpawn rule (lib-python-harness v0.0.12, config/apply.py),
     mirrored: no config, or neither an `agents:` entry for the caller nor any `defaults:`
     -> allowed; otherwise allowed iff the caller's entry sets `canSpawn: true`. Keep in step
     with the pinned lib version -- the module path has no MCP server whose presence could
