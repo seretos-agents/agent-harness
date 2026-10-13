@@ -215,7 +215,11 @@ def _drive_run(run_id: str) -> None:
 
     #72: with lib_python_harness v0.0.11 a gone child held by another process
     is finalized too (the grace window is anchored on the durable last sign
-    of life), so repeated `wait(run_id, 0)` calls from this loop converge."""
+    of life), so repeated `wait(run_id, 0)` calls from this loop converge.
+
+    #86: with v0.0.12 the lib's wait does not grace-kill a child whose `result` is
+    followed by a still-pending `run_in_background` launch, so a single `wait(run_id, 0)`
+    leaves such a child RUNNING (label `background_shell_wait`); no plugin counter-mechanism."""
     try:
         from harness_plugin.runs import harness
 

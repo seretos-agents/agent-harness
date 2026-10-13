@@ -346,3 +346,37 @@ def test_live_grandchild_chain():
         assert child["created_at"] < grand["created_at"], (child["created_at"], grand["created_at"])
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.mark.timeout(600)
+def test_live_native_agent_background_wait():
+    """#86: a subagent that backgrounds `sleep 90; echo SLEEP_DONE` and ends its turn comes
+    back with its real final answer (not a denied `ended FAILED` call after ~18 s)."""
+    _require_live()
+    root = Path(tempfile.mkdtemp(prefix="ah86-"))
+    try:
+        plugin = _build_plugin_dir(root)
+        env, project, artifacts = _session_env(root)
+        proc, wall = _claude(
+            plugin, project, env,
+            "Use the Agent tool with subagent_type general-purpose and the prompt "
+            "'Run the Bash command `sleep 90; echo SLEEP_DONE` with run_in_background true, "
+            "end your turn, and when the command finishes reply with its output.' "
+            "Do nothing else.",
+            timeout=580,
+        )
+        entries = _stream(proc)
+        calls = _agent_calls(entries)
+        assert len(calls) == 1, f"expected exactly one Agent call:\n{proc.stdout!r}\n{proc.stderr!r}"
+        block, entry = _result_for(entries, calls[0]["id"])
+        assert block is not None and not block.get("is_error"), block
+        text = _tool_result_text(block)
+        assert "SLEEP_DONE" in text, text
+        assert DENY_MARKER not in text and "ended FAILED" not in text, text
+        structured = entry.get("tool_use_result")
+        assert isinstance(structured, dict) and structured.get("status") == "completed", structured
+        records = _records(artifacts)
+        assert len(records) == 1 and records[0]["state"] == {"__runstate__": "COMPLETED"}, records
+        assert wall >= 90, wall
+    finally:
+        shutil.rmtree(root, ignore_errors=True)

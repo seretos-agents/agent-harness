@@ -387,3 +387,138 @@ def test_agent_in_harness_child_uses_own_session(tmp_path, project_dir, run_agen
     _assert_agent_output(ans)
     assert "result" in ans, ans
     assert _flag(_argv_entries(env)[-1]["argv"], "--permission-mode") == "bypassPermissions"
+
+
+# --- #86: a child that backgrounds a shell command and ends its turn ---------------------
+
+BG_HOLD_S = 25  # how long the fake child holds after its first `result` (> grace 3 s + the checks)
+BG_LABEL = "background_shell_wait"
+CEILING_MS = "3600000"  # lib-python-harness v0.0.12's default, applied on start and resume
+
+
+def _wait_for_first_result(env, timeout=40):
+    """(run_id, events_path) once the fake child's FIRST `result` is on disk."""
+    root = Path(env["HARNESS_ARTIFACTS_DIR"])
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for rec in root.glob("*/record.json") if root.is_dir() else []:
+            events = rec.parent / "events.jsonl"
+            if events.is_file() and '"type": "result"' in events.read_text(encoding="utf-8", errors="replace"):
+                return rec.parent.name, events
+        time.sleep(0.2)
+    raise AssertionError("the fake child never wrote its first result")
+
+
+def _record(env, run_id):
+    return json.loads((Path(env["HARNESS_ARTIFACTS_DIR"]) / run_id / "record.json").read_text(encoding="utf-8"))
+
+
+def test_agent_background_wait_completes(
+    hooked_session, tmp_path, run_agent_cmd, wait_run_cmd, module_mts, monkeypatch
+):
+    """R1/R3/R4: the native Agent call survives its child's background-shell wait and returns the
+    child's real final answer; while held, poll/wait/Stop report RUNNING + `background_shell_wait`
+    and nothing kills or finalizes the child."""
+    import anyio
+    from harness_plugin import runs, server
+    from harness_plugin.hooks import write_context
+    from lib_python_harness.runtime.process import _pid_status
+
+    env = _host_env(tmp_path)
+    proc = _driver_popen(module_mts, "Agent", _agent_event(prompt=f"BG_WAIT:{BG_HOLD_S}"), env, _prefix(run_agent_cmd))
+    try:
+        run_id, _events = _wait_for_first_result(env)
+        time.sleep(4)  # past the lib's post-result grace (3 s)
+        # In-process readers (and the Stop driver) must see THIS test's store before the first call.
+        for key in ("HARNESS_ARTIFACTS_DIR", "HARNESS_CLAUDE_ARGV"):
+            monkeypatch.setenv(key, env[key])
+        monkeypatch.setattr(runs, "_HARNESS", None)
+
+        # R4: the Stop hook's driver, twice, spaced; the held child is neither killed nor finalized.
+        write_context._drive_run(run_id)
+        # R3: the `harness wait` CLI (a different process) reports RUNNING, exit 2.
+        waited = subprocess.run(
+            [*wait_run_cmd, run_id, "--timeout", "1", "--interval", "0.5"],
+            capture_output=True, text=True, env={**os.environ, **env}, timeout=60,
+        )
+        assert waited.returncode == 2, (waited.stdout, waited.stderr)
+        w = _one_json(waited.stdout)
+        assert (w["state"], w["last_activity"]) == ("RUNNING", BG_LABEL), w
+        assert _is_num(w["last_event_at"]), w
+
+        # R3: harness_poll_run and harness_wait_run in-process (own Harness, no spawner state).
+        polled = anyio.run(server.harness_poll_run, run_id)
+        assert (polled["state"], polled["last_activity"]) == ("RUNNING", BG_LABEL), polled
+        assert _is_num(polled["last_event_at"]), polled
+        waited_in_proc = anyio.run(server.harness_wait_run, run_id, 1)
+        assert (waited_in_proc["state"], waited_in_proc["last_activity"]) == ("RUNNING", BG_LABEL), waited_in_proc
+
+        time.sleep(1)
+        write_context._drive_run(run_id)
+        record = _record(env, run_id)
+        assert record["state"] == {"__runstate__": "RUNNING"}, record["state"]
+        assert _pid_status(record["pid"], record.get("start_time")) is True, "the held child was killed"
+    except BaseException:
+        proc.kill()
+        raise
+    out = _answer(proc)
+
+    # R1: the real final answer, not a deny.
+    _assert_agent_output(out)
+    assert "result" in out, out
+    assert out["result"]["content"][0]["text"] == "SLEEP_DONE"
+    assert out["result"]["totalDurationMs"] >= BG_HOLD_S * 1000 * 0.8
+    stored = _stored_result(env, out["result"]["agentId"])
+    assert stored.state.name == "COMPLETED" and stored.text == "SLEEP_DONE"
+    # R2 (start): the child's env carries a bg-wait ceiling above Claude's own 600 s.
+    assert _argv_entries(env)[-1]["bg_wait_ceiling"] == CEILING_MS
+
+
+def test_send_message_carries_bg_wait_ceiling(
+    hooked_session, tmp_path, run_agent_cmd, send_message_cmd, module_mts
+):
+    """R2 (resume): a SendMessage resume launches the child with the same raised ceiling."""
+    env = _host_env(tmp_path)
+    origin = _origin(run_agent_cmd, env, prompt="ECHO:a")
+    ans = _call(module_mts, "SendMessage", {"to": origin, "message": "ECHO:b"}, env, _prefix(send_message_cmd))
+    _assert_send_output(ans)
+    entries = _argv_entries(env)
+    assert "--resume" in entries[-1]["argv"], entries[-1]["argv"]
+    assert entries[-1]["bg_wait_ceiling"] == CEILING_MS
+
+
+@pytest.mark.parametrize(
+    "events,expected",
+    [
+        ("launch_ack_result", BG_LABEL),  # result written, launch still pending
+        ("plain_result", None),  # result, nothing pending: normal label
+        ("launch_no_result", None),  # launch pending but no result yet: still running normally
+    ],
+)
+def test_background_wait_label_only_with_result_and_pending_launch(tmp_path, monkeypatch, events, expected):
+    """The label is conditional: a RUNNING run keeps its normal label unless a `result` has
+    been written while a `run_in_background` launch is still pending."""
+    from harness_plugin import runs
+
+    launch = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "x", "run_in_background": True}}]}}
+    ack = {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "Command running in background with ID: b1."}]}}
+    result = {"type": "result", "subtype": "success", "is_error": False, "result": "r", "session_id": "s"}
+    seq = {
+        "launch_ack_result": [launch, ack, result],
+        "plain_result": [result],
+        "launch_no_result": [launch, ack],
+    }[events]
+    path = tmp_path / "events.jsonl"
+    path.write_text("\n".join(json.dumps(e) for e in seq) + "\n", encoding="utf-8")
+
+    class _Store:
+        def get(self, run_id):
+            return {"events_path": str(path)}
+
+    class _H:
+        store = _Store()
+
+    monkeypatch.setattr(runs, "harness", lambda: _H())
+    assert runs._background_wait_activity("rid") == expected

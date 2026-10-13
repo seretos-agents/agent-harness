@@ -254,7 +254,8 @@ async def harness_poll_run(run_id: str) -> dict[str, Any]:
     lingers after writing its result (the lib's post-completion grace period; see #68).
     While the run is RUNNING, `event_count` and `last_event_at` show progress: they only
     advance while `state` is RUNNING, so a growing count means the run is working and a
-    frozen one means it may be hung; once the run is terminal they reset to 0 and None."""
+    frozen one means it may be hung -- unless `last_activity` is `background_shell_wait`
+    (the child answered once and waits for its own background shell command: not hung); once the run is terminal they reset to 0 and None."""
     h = harness()
     result = await anyio.to_thread.run_sync(partial(h.wait, run_id, 0))
     return run_to_dict(result)
@@ -290,7 +291,8 @@ async def harness_wait_run(run_id: str, timeout_seconds: float = 300.0) -> dict[
     result. The time limit ends only the waiting, never the run: nothing is cancelled. If
     it expires first the run is still RUNNING and the answer says so, with liveness fields
     (`duration_s`, `event_count`, `last_event_at`, `last_activity` = the last tool/command
-    the run used) and a `next_step` hint. Only harness_stop_run cancels a run. To keep
+    the run used, or `background_shell_wait` while the child waits for its own background
+    shell command: not stalled, never cancel it) and a `next_step` hint. Only harness_stop_run cancels a run. To keep
     waiting past a tool call, run the shell command `harness wait <run_id>` in the
     background (blocks until the run ends; see the `harness-wait` skill), or call this
     tool again; harness_poll_run checks without waiting."""
